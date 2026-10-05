@@ -1,6 +1,7 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include "forwards.h"
 #include "slf.h"
 #include "slf_functions.h"
@@ -696,10 +697,45 @@ char second_costume[64] = "venom";
 DWORD* second_hero_entity = NULL;
 DWORD* second_hero_ctrl = NULL;
 
+// logs to the console AND appends to usm_2p_log.txt (the console closes when the game dies)
+static void twop_log(const char* fmt, ...) {
+	va_list args;
+	va_start(args, fmt);
+	vprintf(fmt, args);
+	va_end(args);
+
+	FILE* f = fopen("usm_2p_log.txt", "a");
+	if (f) {
+		va_start(args, fmt);
+		vfprintf(f, fmt, args);
+		va_end(args);
+		fclose(f);
+	}
+}
+
 static int second_hero_filter(EXCEPTION_POINTERS* ep) {
-	printf("[2P] EXCEPTION %08X at %08X\n",
-		(unsigned)ep->ExceptionRecord->ExceptionCode,
-		(unsigned)(DWORD)ep->ExceptionRecord->ExceptionAddress);
+	EXCEPTION_RECORD* er = ep->ExceptionRecord;
+	CONTEXT* c = ep->ContextRecord;
+
+	twop_log("[2P] EXCEPTION %08X at %08X\n", (unsigned)er->ExceptionCode, (unsigned)(DWORD)er->ExceptionAddress);
+	if (er->NumberParameters >= 2)
+		twop_log("[2P] fault type: %s of address %08X\n", er->ExceptionInformation[0] ? "WRITE" : "READ", (unsigned)er->ExceptionInformation[1]);
+	twop_log("[2P] eax=%08X ecx=%08X edx=%08X ebx=%08X\n", (unsigned)c->Eax, (unsigned)c->Ecx, (unsigned)c->Edx, (unsigned)c->Ebx);
+	twop_log("[2P] esi=%08X edi=%08X ebp=%08X esp=%08X\n", (unsigned)c->Esi, (unsigned)c->Edi, (unsigned)c->Ebp, (unsigned)c->Esp);
+
+	// walk the stack looking for return addresses inside USM.exe's code (value right after a CALL instruction)
+	DWORD* sp = (DWORD*)c->Esp;
+	int printed = 0;
+	for (int i = 0; i < 384 && printed < 32; i++) {
+		DWORD v = sp[i];
+		if (v >= 0x00401000 && v < 0x0086F000) {
+			BYTE* b = (BYTE*)v;
+			if (b[-5] == 0xE8 || (b[-2] == 0xFF && (b[-1] & 0x38) == 0x10) || (b[-3] == 0xFF && (b[-2] & 0x38) == 0x10) || (b[-6] == 0xFF && (b[-5] & 0x38) == 0x10)) {
+				twop_log("[2P]   return address %08X (esp+%X)\n", (unsigned)v, i * 4);
+				printed++;
+			}
+		}
+	}
 	return EXCEPTION_EXECUTE_HANDLER;
 }
 
@@ -714,7 +750,7 @@ static void spawn_second_hero(const char* costume) {
 	DWORD saved_global = *(DWORD*)0x00959A70;
 
 	if (!hero0) {
-		puts("[2P] no existing hero, aborting");
+		twop_log("[2P] no existing hero, aborting\n");
 		return;
 	}
 
@@ -732,8 +768,16 @@ static void spawn_second_hero(const char* costume) {
 	((DWORD*)shadow)[0x238 / 4] = 0;                   // "no players yet"
 	mString_constructor((mString*)(shadow + 0x3E0), NULL, "");
 
-	printf("[2P] hero0 entity %08X, spawning '%s' via shadow world %08X\n",
-		(unsigned)(DWORD)hero0, costume, (unsigned)(DWORD)shadow);
+	twop_log("[2P] ---- new attempt ----\n");
+	twop_log("[2P] world %08X, real player count %u, hero0 entity %08X\n",
+		(unsigned)(DWORD)world, (unsigned)world[0x238 / 4], (unsigned)(DWORD)hero0);
+	if (name_buf) {
+		char shown[33];
+		memcpy(shown, saved_name, 32);
+		shown[32] = 0;
+		twop_log("[2P] current hero name in game state: '%s'\n", shown);
+	}
+	twop_log("[2P] spawning '%s' via shadow world %08X\n", costume, (unsigned)(DWORD)shadow);
 
 	mString name;
 	mString_constructor(&name, NULL, (char*)costume);
@@ -758,14 +802,14 @@ static void spawn_second_hero(const char* costume) {
 	DWORD* new_ctrl = (DWORD*)((DWORD*)shadow)[0x234 / 4];
 
 	if (!ok || new_count != 1 || new_hero == hero0) {
-		printf("[2P] FAILED (ok=%d, shadow count=%u, new hero=%08X)\n",
+		twop_log("[2P] FAILED (ok=%d, shadow count=%u, new hero=%08X)\n",
 			ok, (unsigned)new_count, (unsigned)(DWORD)new_hero);
 		return;
 	}
 
 	second_hero_entity = new_hero;
 	second_hero_ctrl = new_ctrl;
-	printf("[2P] SUCCESS: second hero entity %08X, controller object %08X\n",
+	twop_log("[2P] SUCCESS: second hero entity %08X, controller object %08X\n",
 		(unsigned)(DWORD)new_hero, (unsigned)(DWORD)new_ctrl);
 }
 
@@ -2105,7 +2149,7 @@ void handle_add_player_select_entry(debug_menu_entry* entry) {
 	DWORD* player_count = (*(DWORD**)g_world_ptr) + 142;
 
 	if (!*player_count) {
-		puts("[2P] no existing player, load into the game world first");
+		twop_log("[2P] no existing player, load into the game world first\n");
 		return;
 	}
 
