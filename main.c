@@ -739,6 +739,25 @@ static int second_hero_filter(EXCEPTION_POINTERS* ep) {
 	return EXCEPTION_EXECUTE_HANDLER;
 }
 
+/*
+ * add_player calls 0x0055A420 (at 0x0055B44E) only for player 0. It copies the costume name
+ * into the game state and asks the streamer to load that character's pack. Both logged crashes
+ * happen after/inside this path while a first hero is already loaded, so for the second hero we
+ * skip the request and reuse the resident pack (same character as the first hero).
+ */
+DWORD skip_pack_load = 0;
+
+typedef void(__fastcall* load_hero_pack_ptr)(void* this, void* edx, char* name, int flag);
+load_hero_pack_ptr load_hero_pack_original = (void*)0x0055A420;
+
+void __fastcall load_hero_pack_hook(void* this, void* edx, char* name, int flag) {
+	if (skip_pack_load) {
+		twop_log("[2P] skipped pack-load request for '%s' (flag %d)\n", name ? name : "(null)", flag);
+		return;
+	}
+	load_hero_pack_original(this, edx, name, flag);
+}
+
 static void spawn_second_hero(const char* costume) {
 
 	DWORD* world = *(DWORD**)g_world_ptr;
@@ -777,18 +796,30 @@ static void spawn_second_hero(const char* costume) {
 		shown[32] = 0;
 		twop_log("[2P] current hero name in game state: '%s'\n", shown);
 	}
+	if (name_buf) {
+		char current[33];
+		memcpy(current, saved_name, 32);
+		current[32] = 0;
+		if (strcmp(costume, current) != 0) {
+			twop_log("[2P] '%s' is not the loaded character pack; spawning '%s' instead (a different pack can't be loaded yet)\n", costume, current);
+			strcpy(second_costume, current);
+			costume = second_costume;
+		}
+	}
 	twop_log("[2P] spawning '%s' via shadow world %08X\n", costume, (unsigned)(DWORD)shadow);
 
 	mString name;
 	mString_constructor(&name, NULL, (char*)costume);
 
 	int ok = 1;
+	skip_pack_load = 1;
 	__try {
 		world_dynamics_system_add_player(shadow, NULL, &name);
 	}
 	__except (second_hero_filter(GetExceptionInformation())) {
 		ok = 0;
 	}
+	skip_pack_load = 0;
 
 	mString_finalize(&name, NULL, 0);
 
@@ -2033,6 +2064,8 @@ void install_patches() {
 	HookFunc(0x0055D742, game_handle_game_states, 0, "Hooking handle_game_states");
 
 	HookFunc(0x00421128, sub_41F9D0_hook, 0, "Hooking sub_41F9D0");
+
+	HookFunc(0x0055B44E, load_hero_pack_hook, 0, "Hooking add_player's call to the hero pack loader (2nd player experiment)");
 
 
 	/*
