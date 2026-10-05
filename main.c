@@ -669,6 +669,106 @@ char* current_costume = "ultimate_spiderman";
 DWORD adding_second_player = 0;
 char second_costume[64] = "venom";
 
+/*
+ * Second hero, reusing the game's own add_player (0x0055B400).
+ *
+ * What the disassembly shows:
+ *   - add_player returns immediately if world[+0x238] (player count) >= 1.
+ *   - It stores the new hero entity at world[+0x230 + count*4] and a per-player
+ *     controller object at world[+0x234 + count*4]. The world struct only has
+ *     room for ONE of each: with count == 1 the second store would land on the
+ *     count field itself. So simply NOPing the guard would corrupt the world.
+ *   - `this` is only used at +0x230, +0x234, +0x238 and +0x3E0 (current hero name).
+ *
+ * So we call the real add_player against a SHADOW block that looks like
+ * "no players yet" (count = 0), then keep the results in our own variables.
+ * The real world struct is never written. Two pieces of global state are
+ * touched by the count == 0 path and are snapshotted/restored:
+ *   - the 32-byte current-hero-name buffer at [[0x9682E0]+0xC0]+0x454
+ *   - the global at 0x959A70 (set to the new controller object for player 0)
+ *
+ * Known limitations of this first experiment:
+ *   - the player index passed to the hero's brain object is 0, so the second
+ *     hero will most likely read the SAME input as the first (a mirror)
+ *   - the entity is named "HERO" like the first one
+ *   - the second hero is not in the world's player list
+ */
+DWORD* second_hero_entity = NULL;
+DWORD* second_hero_ctrl = NULL;
+
+static int second_hero_filter(EXCEPTION_POINTERS* ep) {
+	printf("[2P] EXCEPTION %08X at %08X\n",
+		(unsigned)ep->ExceptionRecord->ExceptionCode,
+		(unsigned)(DWORD)ep->ExceptionRecord->ExceptionAddress);
+	return EXCEPTION_EXECUTE_HANDLER;
+}
+
+static void spawn_second_hero(const char* costume) {
+
+	DWORD* world = *(DWORD**)g_world_ptr;
+	DWORD* hero0 = (DWORD*)world[0x230 / 4];
+
+	DWORD* game_state_obj = *(DWORD**)0x009682E0;
+	BYTE* name_buf = NULL;
+	BYTE saved_name[32];
+	DWORD saved_global = *(DWORD*)0x00959A70;
+
+	if (!hero0) {
+		puts("[2P] no existing hero, aborting");
+		return;
+	}
+
+	if (game_state_obj) {
+		name_buf = (BYTE*)(*(DWORD*)((BYTE*)game_state_obj + 0xC0)) + 0x454;
+		memcpy(saved_name, name_buf, sizeof(saved_name));
+	}
+
+	// shadow world: intentionally leaked (2KB), never freed in case the engine keeps a pointer
+	BYTE* shadow = calloc(1, 0x800);
+	panic(shadow);
+
+	((DWORD*)shadow)[0x230 / 4] = (DWORD)hero0;        // spawn reference = existing hero
+	((DWORD*)shadow)[0x234 / 4] = world[0x234 / 4];
+	((DWORD*)shadow)[0x238 / 4] = 0;                   // "no players yet"
+	mString_constructor((mString*)(shadow + 0x3E0), NULL, "");
+
+	printf("[2P] hero0 entity %08X, spawning '%s' via shadow world %08X\n",
+		(unsigned)(DWORD)hero0, costume, (unsigned)(DWORD)shadow);
+
+	mString name;
+	mString_constructor(&name, NULL, (char*)costume);
+
+	int ok = 1;
+	__try {
+		world_dynamics_system_add_player(shadow, NULL, &name);
+	}
+	__except (second_hero_filter(GetExceptionInformation())) {
+		ok = 0;
+	}
+
+	mString_finalize(&name, NULL, 0);
+
+	// put back the global state the count == 0 path overwrote
+	if (name_buf)
+		memcpy(name_buf, saved_name, sizeof(saved_name));
+	*(DWORD*)0x00959A70 = saved_global;
+
+	DWORD new_count = ((DWORD*)shadow)[0x238 / 4];
+	DWORD* new_hero = (DWORD*)((DWORD*)shadow)[0x230 / 4];
+	DWORD* new_ctrl = (DWORD*)((DWORD*)shadow)[0x234 / 4];
+
+	if (!ok || new_count != 1 || new_hero == hero0) {
+		printf("[2P] FAILED (ok=%d, shadow count=%u, new hero=%08X)\n",
+			ok, (unsigned)new_count, (unsigned)(DWORD)new_hero);
+		return;
+	}
+
+	second_hero_entity = new_hero;
+	second_hero_ctrl = new_ctrl;
+	printf("[2P] SUCCESS: second hero entity %08X, controller object %08X\n",
+		(unsigned)(DWORD)new_hero, (unsigned)(DWORD)new_ctrl);
+}
+
 
 typedef (*entity_teleport_abs_po_ptr)(DWORD, float*, int one);
 entity_teleport_abs_po_ptr entity_teleport_abs_po = (void*)0x004F3890;
@@ -1322,15 +1422,7 @@ int __fastcall game_handle_game_states(void* this, void* edx, void* a2) {
 		adding_second_player--;
 
 		if (!adding_second_player) {
-			DWORD* player_count = (*(DWORD**)g_world_ptr) + 142;
-			printf("[2P] players before add_player: %d\n", (int)*player_count);
-
-			mString str;
-			mString_constructor(&str, NULL, second_costume);
-			world_dynamics_system_add_player(*(DWORD**)g_world_ptr, NULL, &str);
-			mString_finalize(&str, NULL, 0);
-
-			printf("[2P] players after add_player: %d (costume %s)\n", (int)*player_count, second_costume);
+			spawn_second_hero(second_costume);
 			game_unpause(g_game_ptr);
 		}
 	}
