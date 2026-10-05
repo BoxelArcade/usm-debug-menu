@@ -164,6 +164,7 @@ debug_menu* char_select_menu = NULL;
 debug_menu* options_menu = NULL;
 debug_menu* script_menu = NULL;
 debug_menu* progression_menu = NULL;
+debug_menu* add_player_menu = NULL;
 
 
 debug_menu** all_menus[] = {
@@ -173,7 +174,8 @@ debug_menu** all_menus[] = {
 	&char_select_menu,
 	&options_menu,
 	&script_menu,
-	&progression_menu
+	&progression_menu,
+	&add_player_menu
 };
 
 debug_menu* current_menu = NULL;
@@ -662,6 +664,10 @@ world_dynamics_system_add_player_ptr world_dynamics_system_add_player = (void*)0
 
 DWORD changing_model = 0;
 char* current_costume = "ultimate_spiderman";
+
+// 2nd player experiment: spawn an extra hero WITHOUT removing the existing one
+DWORD adding_second_player = 0;
+char second_costume[64] = "venom";
 
 
 typedef (*entity_teleport_abs_po_ptr)(DWORD, float*, int one);
@@ -1307,6 +1313,24 @@ int __fastcall game_handle_game_states(void* this, void* edx, void* a2) {
 			mString_constructor(&str, NULL, current_costume);
 			world_dynamics_system_add_player(*(DWORD**)g_world_ptr, NULL, &str);
 			mString_finalize(&str, NULL, 0);
+			game_unpause(g_game_ptr);
+		}
+	}
+
+	if (adding_second_player) {
+
+		adding_second_player--;
+
+		if (!adding_second_player) {
+			DWORD* player_count = (*(DWORD**)g_world_ptr) + 142;
+			printf("[2P] players before add_player: %d\n", (int)*player_count);
+
+			mString str;
+			mString_constructor(&str, NULL, second_costume);
+			world_dynamics_system_add_player(*(DWORD**)g_world_ptr, NULL, &str);
+			mString_finalize(&str, NULL, 0);
+
+			printf("[2P] players after add_player: %d (costume %s)\n", (int)*player_count, second_costume);
 			game_unpause(g_game_ptr);
 		}
 	}
@@ -1984,6 +2008,23 @@ void handle_char_select_entry(debug_menu_entry* entry) {
 }
 
 
+void handle_add_player_select_entry(debug_menu_entry* entry) {
+
+	DWORD* player_count = (*(DWORD**)g_world_ptr) + 142;
+
+	if (!*player_count) {
+		puts("[2P] no existing player, load into the game world first");
+		return;
+	}
+
+	strncpy(second_costume, entry->text, sizeof(second_costume) - 1);
+	second_costume[sizeof(second_costume) - 1] = 0;
+
+	debug_enabled = 0;
+	adding_second_player = 2;
+}
+
+
 void handle_options_select_entry(debug_menu_entry* entry) {
 
 	BYTE* val = entry->data;
@@ -2042,6 +2083,7 @@ void setup_debug_menu() {
 	script_menu = create_menu("Script", goto_start_debug, (menu_handler_function)handle_script_select_entry, 50);
 	progression_menu = create_menu("Progression", goto_start_debug, (menu_handler_function)handle_progression_select_entry, 10);
 	district_variants_menu = create_menu("District variants", goto_start_debug, (menu_handler_function)handle_distriction_variants_select_entry, 15);
+	add_player_menu = create_menu("Add 2nd Player", goto_start_debug, (menu_handler_function)handle_add_player_select_entry, 10);
 
 
 	debug_menu_entry warp_entry = { "Warp", NORMAL, warp_menu };
@@ -2050,10 +2092,12 @@ void setup_debug_menu() {
 	debug_menu_entry script_entry = { "Script", NORMAL, script_menu };
 	debug_menu_entry progression_entry = { "Progression", NORMAL, progression_menu };
 	debug_menu_entry district_entry = { "District variants", NORMAL, district_variants_menu };
+	debug_menu_entry add_player_entry = { "Add 2nd Player", NORMAL, add_player_menu };
 
 	add_debug_menu_entry(start_debug, &warp_entry);
 	add_debug_menu_entry(start_debug, &district_entry);
 	add_debug_menu_entry(start_debug, &char_select);
+	add_debug_menu_entry(start_debug, &add_player_entry);
 	add_debug_menu_entry(start_debug, &options_entry);
 	add_debug_menu_entry(start_debug, &script_entry);
 	add_debug_menu_entry(start_debug, &progression_entry);
@@ -2078,6 +2122,7 @@ void setup_debug_menu() {
 		strcpy(char_entry.text, costumes[i]);
 
 		add_debug_menu_entry(char_select_menu, &char_entry);
+		add_debug_menu_entry(add_player_menu, &char_entry);
 	}
 
 
