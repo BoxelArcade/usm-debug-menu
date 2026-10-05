@@ -1,4 +1,4 @@
-# Ultimate Spider-Man Debug menu for PC 
+# Ultimate Spider-Man Debug menu & Local Co OP for PC 
 
 **Recreation** of the PS2 version's debug menu for the PC version
 
