@@ -762,6 +762,142 @@ static void set_extra_heroes_player_index(int idx) {
 }
 
 /*
+ * ---- pad objects -------------------------------------------------------------------------
+ * [0x967BB0] is a pad manager: vtable, then 4 pad objects (0x9C bytes each) at +4,+8,+0xC,+0x10.
+ * Pad i has script id 0xF4240+i at +4, and a per-frame update() (vtable slot 9, 0x58E5C0) that
+ * calls get_pad(pad[+0x70], &pad[+8]) to fill its snapshot. Heroes never touch the manager
+ * directly, so each hero must keep a pointer to the pad it reads. All of them point at pad 0.
+ */
+static DWORD* pad_manager_pad(int i) {
+	DWORD* mgr = *(DWORD**)0x00967BB0;
+	return mgr ? (DWORD*)mgr[1 + i] : NULL;
+}
+
+static void log_pads(void) {
+	DWORD* mgr = *(DWORD**)0x00967BB0;
+	twop_log("[PAD] manager %08X, connected-pad mask %08X\n", (unsigned)(DWORD)mgr, (unsigned)*(DWORD*)0x00965AC8);
+	for (int i = 0; i < 4; i++) {
+		DWORD* p = pad_manager_pad(i);
+		if (!p) {
+			twop_log("[PAD]   pad %d = NULL\n", i);
+			continue;
+		}
+		twop_log("[PAD]   pad %d = %08X vtbl %08X id(+4) %u (+0x70) %d (+0x88) %d (+0x90) %d\n", i,
+			(unsigned)(DWORD)p, (unsigned)p[0], (unsigned)p[1], (int)p[0x70 / 4], (int)p[0x88 / 4], (int)p[0x90 / 4]);
+	}
+}
+
+// look for pointers to the pad objects (and their script ids) inside an object's memory
+static void scan_object_for_pads(const char* what, DWORD* obj, int bytes) {
+	if (!obj)
+		return;
+	__try {
+		for (int off = 0; off < bytes; off += 4) {
+			DWORD v = *(DWORD*)((BYTE*)obj + off);
+			for (int i = 0; i < 4; i++) {
+				if (v == (DWORD)pad_manager_pad(i) && v)
+					twop_log("[SCAN] %s+0x%X = pads[%d]\n", what, off, i);
+				if (v == 0xF4240u + i)
+					twop_log("[SCAN] %s+0x%X = pad script id %u\n", what, off, (unsigned)v);
+			}
+			if (v == *(DWORD*)0x00967BB0 && v)
+				twop_log("[SCAN] %s+0x%X = pad manager\n", what, off);
+		}
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		twop_log("[SCAN] %s: read fault while scanning\n", what);
+	}
+}
+
+static void scan_hero_for_pads(const char* label, DWORD* hero) {
+	char name[48];
+	if (!hero)
+		return;
+	sprintf(name, "%s entity %08X", label, (unsigned)(DWORD)hero);
+	scan_object_for_pads(name, hero, 0x200);
+	DWORD* brain = (DWORD*)hero[0x8C / 4];
+	if (brain) {
+		sprintf(name, "%s brain %08X", label, (unsigned)(DWORD)brain);
+		scan_object_for_pads(name, brain, 0x424);
+	}
+}
+
+// Experiment (F9 / F10): replace pad pointers found inside the extra heroes with another pad.
+static void repoint_extra_heroes_pad(int to_pad) {
+	DWORD* to = pad_manager_pad(to_pad);
+	DWORD* from = pad_manager_pad(to_pad ? 0 : 1);
+	if (!to || !from) {
+		twop_log("[PAD] cannot repoint, pad missing\n");
+		return;
+	}
+	twop_log("[PAD] repointing extra heroes: %08X (pad %d) -> %08X (pad %d)\n",
+		(unsigned)(DWORD)from, to_pad ? 0 : 1, (unsigned)(DWORD)to, to_pad);
+	for (int h = 0; h < extra_hero_count; h++) {
+		DWORD* objs[2];
+		int sizes[2] = { 0x200, 0x424 };
+		objs[0] = extra_heroes[h];
+		objs[1] = (DWORD*)extra_heroes[h][0x8C / 4];
+		for (int k = 0; k < 2; k++) {
+			if (!objs[k])
+				continue;
+			__try {
+				for (int off = 0; off < sizes[k]; off += 4) {
+					DWORD* slot = (DWORD*)((BYTE*)objs[k] + off);
+					if (*slot == (DWORD)from) {
+						*slot = (DWORD)to;
+						twop_log("[PAD]   hero %d object %d +0x%X patched\n", h, k, off);
+					}
+				}
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+				twop_log("[PAD]   hero %d object %d: read fault\n", h, k);
+			}
+		}
+	}
+}
+
+// raw gamepad values as DirectInput delivers them (to learn axis ranges); rate limited
+static void log_joy_sample(LPDIJOYSTATE2 j) {
+	static int have_base = 0;
+	static LONG b[6];
+	static DWORD last_tick = 0;
+	static int lines = 0;
+
+	LONG cur[6] = { j->lX, j->lY, j->lZ, j->lRx, j->lRy, j->lRz };
+	if (!have_base) {
+		memcpy(b, cur, sizeof(b));
+		have_base = 1;
+		twop_log("[JOY] first sample (assumed at rest): X=%ld Y=%ld Z=%ld Rx=%ld Ry=%ld Rz=%ld POV=%u\n",
+			cur[0], cur[1], cur[2], cur[3], cur[4], cur[5], (unsigned)j->rgdwPOV[0]);
+		return;
+	}
+	if (lines >= 60)
+		return;
+
+	int active = 0;
+	for (int i = 0; i < 6; i++) {
+		LONG d = cur[i] - b[i];
+		if (d > 3000 || d < -3000)
+			active = 1;
+	}
+	int pressed = -1;
+	for (int i = 0; i < 32; i++)
+		if (j->rgbButtons[i]) {
+			pressed = i;
+			active = 1;
+			break;
+		}
+
+	DWORD now = GetTickCount();
+	if (active && now - last_tick > 400) {
+		last_tick = now;
+		lines++;
+		twop_log("[JOY] X=%ld Y=%ld Z=%ld Rx=%ld Ry=%ld Rz=%ld POV=%u button=%d\n",
+			cur[0], cur[1], cur[2], cur[3], cur[4], cur[5], (unsigned)j->rgdwPOV[0], pressed);
+	}
+}
+
+/*
  * ---- control read probe (logging only) ----------------------------------------------------
  * Every control read in the game goes through 0x00821E90 (get_control_value(array, id) -> float).
  * There are 31 call sites. We hook all of them and log, once per (call site, id), any read that
@@ -988,6 +1124,9 @@ static void spawn_second_hero(const char* costume) {
 			(unsigned)new_hero[0], (unsigned)(DWORD)brain, brain ? (int)brain[0x14 / 4] : -1);
 	}
 	log_input_state("after spawning extra hero");
+	log_pads();
+	scan_hero_for_pads("hero0", hero0);
+	scan_hero_for_pads("extra", new_hero);
 	twop_log("[2P] SUCCESS: second hero entity %08X, controller object %08X\n",
 		(unsigned)(DWORD)new_hero, (unsigned)(DWORD)new_ctrl);
 }
@@ -1484,8 +1623,10 @@ HRESULT __stdcall GetDeviceStateHook(IDirectInputDevice8* this, DWORD cbData, LP
 		
 		if (cbData == 256)
 			GetDeviceStateHandleKeyboardInput(lpvData);
-		else if (cbData == sizeof(DIJOYSTATE2))
+		else if (cbData == sizeof(DIJOYSTATE2)) {
 			GetDeviceStateHandleControllerInput(lpvData);
+			log_joy_sample((LPDIJOYSTATE2)lpvData);
+		}
 
 		int game_state = 0;
 		if (g_game_ptr)
@@ -1641,9 +1782,9 @@ int __fastcall game_handle_game_states(void* this, void* edx, void* a2) {
 	}
 
 	if (GetAsyncKeyState(VK_F9) & 1)
-		set_extra_heroes_player_index(1);
+		repoint_extra_heroes_pad(1);
 	if (GetAsyncKeyState(VK_F10) & 1)
-		set_extra_heroes_player_index(0);
+		repoint_extra_heroes_pad(0);
 
 	if (adding_second_player) {
 
