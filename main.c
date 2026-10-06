@@ -2,6 +2,7 @@
 #include <windows.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include <intrin.h>
 #include "forwards.h"
 #include "slf.h"
 #include "slf_functions.h"
@@ -739,6 +740,75 @@ static int second_hero_filter(EXCEPTION_POINTERS* ep) {
 	return EXCEPTION_EXECUTE_HANDLER;
 }
 
+// every extra hero we spawned (so hotkeys / later input code can find them)
+DWORD* extra_heroes[16];
+int extra_hero_count = 0;
+
+// Experiment (F9 / F10): each hero has a "brain" object at entity+0x8C whose +0x14 field holds the
+// player index passed to 0x4C0CD0 by add_player. Set it for all extra heroes and log what happens.
+static void set_extra_heroes_player_index(int idx) {
+	for (int i = 0; i < extra_hero_count; i++) {
+		DWORD* brain = (DWORD*)extra_heroes[i][0x8C / 4];
+		if (!brain) {
+			twop_log("[IDX] extra hero %d (%08X) has no brain object\n", i, (unsigned)(DWORD)extra_heroes[i]);
+			continue;
+		}
+		twop_log("[IDX] extra hero %d entity %08X brain %08X: player index %d -> %d\n",
+			i, (unsigned)(DWORD)extra_heroes[i], (unsigned)(DWORD)brain, (int)brain[0x14 / 4], idx);
+		brain[0x14 / 4] = idx;
+	}
+	if (!extra_hero_count)
+		twop_log("[IDX] no extra heroes spawned yet\n");
+}
+
+/*
+ * ---- control read probe (logging only) ----------------------------------------------------
+ * Every control read in the game goes through 0x00821E90 (get_control_value(array, id) -> float).
+ * There are 31 call sites. We hook all of them and log, once per (call site, id), any read that
+ * returns a non-trivial value, i.e. while you hold a key. This shows which code reads the movement
+ * controls and which controller object (`this`) it reads from.
+ */
+typedef float(__fastcall* get_control_value_ptr)(void* this, void* edx, unsigned id);
+get_control_value_ptr get_control_value_original = (void*)0x00821E90;
+
+#define CONTROL_PROBE_MAX 64
+DWORD control_probe_caller[CONTROL_PROBE_MAX];
+unsigned control_probe_id[CONTROL_PROBE_MAX];
+int control_probe_count = 0;
+
+float __fastcall get_control_value_hook(void* this, void* edx, unsigned id) {
+	float v = get_control_value_original(this, edx, id);
+
+	if ((v > 0.3f || v < -0.3f) && control_probe_count < CONTROL_PROBE_MAX) {
+		DWORD caller = (DWORD)_ReturnAddress();
+		int known = 0;
+		for (int i = 0; i < control_probe_count; i++)
+			if (control_probe_caller[i] == caller && control_probe_id[i] == id)
+				known = 1;
+		if (!known) {
+			control_probe_caller[control_probe_count] = caller;
+			control_probe_id[control_probe_count] = id;
+			control_probe_count++;
+			twop_log("[CTL] read from %08X: this=%08X id=%u value=%.2f\n", (unsigned)caller, (unsigned)(DWORD)this, id, v);
+		}
+	}
+	return v;
+}
+
+static const DWORD control_read_sites[] = {
+	0x00473B91, 0x00473BAA, 0x00473BC4, 0x005A507D, 0x005A50B4, 0x005A50E6, 0x005AD4CA,
+	0x0081D288, 0x0081D29E, 0x0081D2D0, 0x0081D2E6, 0x0081D318, 0x0081D32E, 0x0081D360,
+	0x0081D376, 0x0081D3A8, 0x0081D3BF, 0x0081D3D6, 0x0081D3ED, 0x0081D404, 0x0081D41B,
+	0x0081D432, 0x0081D449, 0x0081D460, 0x0081D47F, 0x0081D49A, 0x0081D4B5, 0x0081D4D0,
+	0x0081D4EB, 0x0081D506, 0x0081D521
+};
+
+void install_control_read_probe(void) {
+	for (int i = 0; i < (int)(sizeof(control_read_sites) / sizeof(control_read_sites[0])); i++)
+		HookFunc(control_read_sites[i], get_control_value_hook, 0, "Hooking a get_control_value call site (probe)");
+	twop_log("[CTL] control read probe installed on %d call sites\n", (int)(sizeof(control_read_sites) / sizeof(control_read_sites[0])));
+}
+
 /*
  * ---- input probe (logging only, changes no behaviour) -------------------------------------
  * What the exe shows:
@@ -910,6 +980,13 @@ static void spawn_second_hero(const char* costume) {
 
 	second_hero_entity = new_hero;
 	second_hero_ctrl = new_ctrl;
+	if (extra_hero_count < 16)
+		extra_heroes[extra_hero_count++] = new_hero;
+	{
+		DWORD* brain = (DWORD*)new_hero[0x8C / 4];
+		twop_log("[2P] extra hero entity vtable %08X, brain object %08X, brain player index %d\n",
+			(unsigned)new_hero[0], (unsigned)(DWORD)brain, brain ? (int)brain[0x14 / 4] : -1);
+	}
 	log_input_state("after spawning extra hero");
 	twop_log("[2P] SUCCESS: second hero entity %08X, controller object %08X\n",
 		(unsigned)(DWORD)new_hero, (unsigned)(DWORD)new_ctrl);
@@ -1563,6 +1640,11 @@ int __fastcall game_handle_game_states(void* this, void* edx, void* a2) {
 		}
 	}
 
+	if (GetAsyncKeyState(VK_F9) & 1)
+		set_extra_heroes_player_index(1);
+	if (GetAsyncKeyState(VK_F10) & 1)
+		set_extra_heroes_player_index(0);
+
 	if (adding_second_player) {
 
 		adding_second_player--;
@@ -2137,7 +2219,7 @@ void install_patches() {
 	HookFunc(0x00421128, sub_41F9D0_hook, 0, "Hooking sub_41F9D0");
 
 	HookFunc(0x0055B44E, load_hero_pack_hook, 0, "Hooking add_player's call to the hero pack loader (2nd player experiment)");
-	install_hero_input_probe();
+	install_control_read_probe();
 
 
 	/*
