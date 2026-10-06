@@ -1,6 +1,9 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
 #include <stdio.h>
+#include <stdarg.h>
+#include <math.h>
+#include <intrin.h>
 #include "forwards.h"
 #include "slf.h"
 #include "slf_functions.h"
@@ -164,6 +167,7 @@ debug_menu* char_select_menu = NULL;
 debug_menu* options_menu = NULL;
 debug_menu* script_menu = NULL;
 debug_menu* progression_menu = NULL;
+debug_menu* add_player_menu = NULL;
 
 
 debug_menu** all_menus[] = {
@@ -173,7 +177,8 @@ debug_menu** all_menus[] = {
 	&char_select_menu,
 	&options_menu,
 	&script_menu,
-	&progression_menu
+	&progression_menu,
+	&add_player_menu
 };
 
 debug_menu* current_menu = NULL;
@@ -452,6 +457,8 @@ nglSetQuadZ_ptr nglSetQuadZ = (void*)0x0077AD70;
 typedef void (*nglSetClearFlags_ptr)(int);
 nglSetClearFlags_ptr nglSetClearFlags = (void*)0x00769DB0;
 
+void draw_p2_indicator(void);
+
 void aeps_RenderAll() {
 
 
@@ -468,6 +475,8 @@ void aeps_RenderAll() {
 	nglListAddString(*nglSysFont, 0.1f, 0.2f, 0.2f, nglColor(red, green, blue, 255), 1.f, 1.f, "Krystalgamer's Debug menu");
 
 	cur_time = (cur_time + 1) % duration;
+
+	draw_p2_indicator();
 
 
 	aeps_RenderAll_orig();
@@ -662,6 +671,973 @@ world_dynamics_system_add_player_ptr world_dynamics_system_add_player = (void*)0
 
 DWORD changing_model = 0;
 char* current_costume = "ultimate_spiderman";
+
+// 2nd player experiment: spawn an extra hero WITHOUT removing the existing one
+DWORD adding_second_player = 0;
+char second_costume[64] = "venom";
+
+/*
+ * Second hero, reusing the game's own add_player (0x0055B400).
+ *
+ * What the disassembly shows:
+ *   - add_player returns immediately if world[+0x238] (player count) >= 1.
+ *   - It stores the new hero entity at world[+0x230 + count*4] and a per-player
+ *     controller object at world[+0x234 + count*4]. The world struct only has
+ *     room for ONE of each: with count == 1 the second store would land on the
+ *     count field itself. So simply NOPing the guard would corrupt the world.
+ *   - `this` is only used at +0x230, +0x234, +0x238 and +0x3E0 (current hero name).
+ *
+ * So we call the real add_player against a SHADOW block that looks like
+ * "no players yet" (count = 0), then keep the results in our own variables.
+ * The real world struct is never written. Two pieces of global state are
+ * touched by the count == 0 path and are snapshotted/restored:
+ *   - the 32-byte current-hero-name buffer at [[0x9682E0]+0xC0]+0x454
+ *   - the global at 0x959A70 (set to the new controller object for player 0)
+ *
+ * Known limitations of this first experiment:
+ *   - the player index passed to the hero's brain object is 0, so the second
+ *     hero will most likely read the SAME input as the first (a mirror)
+ *   - the entity is named "HERO" like the first one
+ *   - the second hero is not in the world's player list
+ */
+DWORD* second_hero_entity = NULL;
+DWORD* second_hero_ctrl = NULL;
+
+// logs to the console AND appends to usm_2p_log.txt (the console closes when the game dies)
+static void twop_log(const char* fmt, ...) {
+	va_list args;
+	va_start(args, fmt);
+	vprintf(fmt, args);
+	va_end(args);
+
+	FILE* f = fopen("usm_2p_log.txt", "a");
+	if (f) {
+		va_start(args, fmt);
+		vfprintf(f, fmt, args);
+		va_end(args);
+		fclose(f);
+	}
+}
+
+static int second_hero_filter(EXCEPTION_POINTERS* ep) {
+	EXCEPTION_RECORD* er = ep->ExceptionRecord;
+	CONTEXT* c = ep->ContextRecord;
+
+	twop_log("[2P] EXCEPTION %08X at %08X\n", (unsigned)er->ExceptionCode, (unsigned)(DWORD)er->ExceptionAddress);
+	if (er->NumberParameters >= 2)
+		twop_log("[2P] fault type: %s of address %08X\n", er->ExceptionInformation[0] ? "WRITE" : "READ", (unsigned)er->ExceptionInformation[1]);
+	twop_log("[2P] eax=%08X ecx=%08X edx=%08X ebx=%08X\n", (unsigned)c->Eax, (unsigned)c->Ecx, (unsigned)c->Edx, (unsigned)c->Ebx);
+	twop_log("[2P] esi=%08X edi=%08X ebp=%08X esp=%08X\n", (unsigned)c->Esi, (unsigned)c->Edi, (unsigned)c->Ebp, (unsigned)c->Esp);
+
+	// walk the stack looking for return addresses inside USM.exe's code (value right after a CALL instruction)
+	DWORD* sp = (DWORD*)c->Esp;
+	int printed = 0;
+	for (int i = 0; i < 384 && printed < 32; i++) {
+		DWORD v = sp[i];
+		if (v >= 0x00401000 && v < 0x0086F000) {
+			BYTE* b = (BYTE*)v;
+			if (b[-5] == 0xE8 || (b[-2] == 0xFF && (b[-1] & 0x38) == 0x10) || (b[-3] == 0xFF && (b[-2] & 0x38) == 0x10) || (b[-6] == 0xFF && (b[-5] & 0x38) == 0x10)) {
+				twop_log("[2P]   return address %08X (esp+%X)\n", (unsigned)v, i * 4);
+				printed++;
+			}
+		}
+	}
+	return EXCEPTION_EXECUTE_HANDLER;
+}
+
+// every extra hero we spawned (so hotkeys / later input code can find them)
+DWORD* extra_heroes[16];
+int extra_hero_count = 0;
+
+// each extra hero also got its own chase camera object (the 2nd object add_player builds)
+DWORD* extra_cams[16];
+int extra_cam_count = 0;
+
+// Experiment (F9 / F10): each hero has a "brain" object at entity+0x8C whose +0x14 field holds the
+// player index passed to 0x4C0CD0 by add_player. Set it for all extra heroes and log what happens.
+static void set_extra_heroes_player_index(int idx) {
+	for (int i = 0; i < extra_hero_count; i++) {
+		DWORD* brain = (DWORD*)extra_heroes[i][0x8C / 4];
+		if (!brain) {
+			twop_log("[IDX] extra hero %d (%08X) has no brain object\n", i, (unsigned)(DWORD)extra_heroes[i]);
+			continue;
+		}
+		twop_log("[IDX] extra hero %d entity %08X brain %08X: player index %d -> %d\n",
+			i, (unsigned)(DWORD)extra_heroes[i], (unsigned)(DWORD)brain, (int)brain[0x14 / 4], idx);
+		brain[0x14 / 4] = idx;
+	}
+	if (!extra_hero_count)
+		twop_log("[IDX] no extra heroes spawned yet\n");
+}
+
+/*
+ * ---- pad objects -------------------------------------------------------------------------
+ * [0x967BB0] is a pad manager: vtable, then 4 pad objects (0x9C bytes each) at +4,+8,+0xC,+0x10.
+ * Pad i has script id 0xF4240+i at +4, and a per-frame update() (vtable slot 9, 0x58E5C0) that
+ * calls get_pad(pad[+0x70], &pad[+8]) to fill its snapshot. Heroes never touch the manager
+ * directly, so each hero must keep a pointer to the pad it reads. All of them point at pad 0.
+ */
+static DWORD* pad_manager_pad(int i) {
+	DWORD* mgr = *(DWORD**)0x00967BB0;
+	return mgr ? (DWORD*)mgr[1 + i] : NULL;
+}
+
+static void log_pads(void) {
+	DWORD* mgr = *(DWORD**)0x00967BB0;
+	twop_log("[PAD] manager %08X, connected-pad mask %08X\n", (unsigned)(DWORD)mgr, (unsigned)*(DWORD*)0x00965AC8);
+	for (int i = 0; i < 4; i++) {
+		DWORD* p = pad_manager_pad(i);
+		if (!p) {
+			twop_log("[PAD]   pad %d = NULL\n", i);
+			continue;
+		}
+		twop_log("[PAD]   pad %d = %08X vtbl %08X id(+4) %u (+0x70) %d (+0x88) %d (+0x90) %d\n", i,
+			(unsigned)(DWORD)p, (unsigned)p[0], (unsigned)p[1], (int)p[0x70 / 4], (int)p[0x88 / 4], (int)p[0x90 / 4]);
+	}
+}
+
+// look for pointers to the pad objects (and their script ids) inside an object's memory
+static void scan_object_for_pads(const char* what, DWORD* obj, int bytes) {
+	if (!obj)
+		return;
+	__try {
+		for (int off = 0; off < bytes; off += 4) {
+			DWORD v = *(DWORD*)((BYTE*)obj + off);
+			for (int i = 0; i < 4; i++) {
+				if (v == (DWORD)pad_manager_pad(i) && v)
+					twop_log("[SCAN] %s+0x%X = pads[%d]\n", what, off, i);
+				if (v == 0xF4240u + i)
+					twop_log("[SCAN] %s+0x%X = pad script id %u\n", what, off, (unsigned)v);
+			}
+			if (v == *(DWORD*)0x00967BB0 && v)
+				twop_log("[SCAN] %s+0x%X = pad manager\n", what, off);
+		}
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		twop_log("[SCAN] %s: read fault while scanning\n", what);
+	}
+}
+
+static void scan_hero_for_pads(const char* label, DWORD* hero) {
+	char name[48];
+	if (!hero)
+		return;
+	sprintf(name, "%s entity %08X", label, (unsigned)(DWORD)hero);
+	scan_object_for_pads(name, hero, 0x200);
+	DWORD* brain = (DWORD*)hero[0x8C / 4];
+	if (brain) {
+		sprintf(name, "%s brain %08X", label, (unsigned)(DWORD)brain);
+		scan_object_for_pads(name, brain, 0x424);
+	}
+}
+
+// Experiment (F9 / F10): replace pad pointers found inside the extra heroes with another pad.
+static void repoint_extra_heroes_pad(int to_pad) {
+	DWORD* to = pad_manager_pad(to_pad);
+	DWORD* from = pad_manager_pad(to_pad ? 0 : 1);
+	if (!to || !from) {
+		twop_log("[PAD] cannot repoint, pad missing\n");
+		return;
+	}
+	twop_log("[PAD] repointing extra heroes: %08X (pad %d) -> %08X (pad %d)\n",
+		(unsigned)(DWORD)from, to_pad ? 0 : 1, (unsigned)(DWORD)to, to_pad);
+	for (int h = 0; h < extra_hero_count; h++) {
+		DWORD* objs[2];
+		int sizes[2] = { 0x200, 0x424 };
+		objs[0] = extra_heroes[h];
+		objs[1] = (DWORD*)extra_heroes[h][0x8C / 4];
+		for (int k = 0; k < 2; k++) {
+			if (!objs[k])
+				continue;
+			__try {
+				for (int off = 0; off < sizes[k]; off += 4) {
+					DWORD* slot = (DWORD*)((BYTE*)objs[k] + off);
+					if (*slot == (DWORD)from) {
+						*slot = (DWORD)to;
+						twop_log("[PAD]   hero %d object %d +0x%X patched\n", h, k, off);
+					}
+				}
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+				twop_log("[PAD]   hero %d object %d: read fault\n", h, k);
+			}
+		}
+	}
+}
+
+// raw gamepad values as DirectInput delivers them (to learn axis ranges); rate limited
+static void log_joy_sample(LPDIJOYSTATE2 j) {
+	static int have_base = 0;
+	static LONG b[6];
+	static DWORD last_tick = 0;
+	static int lines = 0;
+
+	LONG cur[6] = { j->lX, j->lY, j->lZ, j->lRx, j->lRy, j->lRz };
+	if (!have_base) {
+		memcpy(b, cur, sizeof(b));
+		have_base = 1;
+		twop_log("[JOY] first sample (assumed at rest): X=%ld Y=%ld Z=%ld Rx=%ld Ry=%ld Rz=%ld POV=%u\n",
+			cur[0], cur[1], cur[2], cur[3], cur[4], cur[5], (unsigned)j->rgdwPOV[0]);
+		return;
+	}
+	if (lines >= 60)
+		return;
+
+	int active = 0;
+	for (int i = 0; i < 6; i++) {
+		LONG d = cur[i] - b[i];
+		if (d > 3000 || d < -3000)
+			active = 1;
+	}
+	int pressed = -1;
+	for (int i = 0; i < 32; i++)
+		if (j->rgbButtons[i]) {
+			pressed = i;
+			active = 1;
+			break;
+		}
+
+	DWORD now = GetTickCount();
+	if (active && now - last_tick > 400) {
+		last_tick = now;
+		lines++;
+		twop_log("[JOY] X=%ld Y=%ld Z=%ld Rx=%ld Ry=%ld Rz=%ld POV=%u button=%d\n",
+			cur[0], cur[1], cur[2], cur[3], cur[4], cur[5], (unsigned)j->rgdwPOV[0], pressed);
+	}
+}
+
+/*
+ * ---- dual input: keyboard+mouse for player 1, controller for player 2 ---------------------
+ * Every pad's update() (vtable entry 0x0088EAA0 -> 0x0058E5C0) calls get_pad(), which re-polls all
+ * DirectInput devices. We hook update() and remember which pad is updating (input_pass). The
+ * DirectInput hook then hands each pass only its own devices:
+ *   pass 0 (pad 0, player 1): keyboard + mouse real, gamepad neutral
+ *   pass 1 (pad 1, player 2): gamepad real, keyboard + mouse zeroed
+ * The game's own button mapping is applied to both, so no snapshot format is guessed.
+ *
+ * Evidence from the logs: hero brains hold the owning pad's script id (0xF4240 + pad number) in
+ * 19 sub-objects (every 0x34 bytes from brain+0x1C). Extra heroes carry pad 0's id, which is why
+ * they mirror player 1. set_dual_input(1) changes those ids to pad 1's id (0xF4241).
+ * Pad 1 itself is marked disconnected (+0x88 = 1, garbage +0x70), so it is brought to life with
+ * pad 0's controller index. All of this is an experiment and is only active between F9 and F10.
+ */
+int dual_input_enabled = 0;
+volatile int input_pass = 0;
+
+typedef void(__fastcall* pad_update_ptr)(void* this, void* edx);
+pad_update_ptr pad_update_original = (void*)0x0058E5C0;
+
+void __fastcall pad_update_hook(void* this, void* edx) {
+	int pass = 0;
+	if (dual_input_enabled && this && this == (void*)pad_manager_pad(1))
+		pass = 1;
+	input_pass = pass;
+	pad_update_original(this, edx);
+	input_pass = 0;
+}
+
+void install_pad_update_hook(void) {
+	DWORD* slot = (DWORD*)0x0088EAA0;
+	DWORD old;
+	if (*slot != 0x0058E5C0) {
+		twop_log("[DUAL] pad update slot holds %08X, not 0058E5C0; hook not installed\n", (unsigned)*slot);
+		return;
+	}
+	if (VirtualProtect(slot, 4, PAGE_READWRITE, &old)) {
+		*slot = (DWORD)pad_update_hook;
+		VirtualProtect(slot, 4, old, &old);
+		twop_log("[DUAL] pad update hook installed\n");
+	}
+}
+
+static void patch_extra_hero_ids(DWORD from, DWORD to) {
+	for (int h = 0; h < extra_hero_count; h++) {
+		DWORD* brain = (DWORD*)extra_heroes[h][0x8C / 4];
+		int patched = 0;
+		if (!brain) {
+			twop_log("[DUAL] extra hero %d has no brain\n", h);
+			continue;
+		}
+		__try {
+			for (int off = 0; off < 0x424; off += 4) {
+				DWORD* slot = (DWORD*)((BYTE*)brain + off);
+				if (*slot == from) {
+					*slot = to;
+					patched++;
+				}
+			}
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) {
+			twop_log("[DUAL] extra hero %d: read fault\n", h);
+		}
+		twop_log("[DUAL] extra hero %d (brain %08X): %d ids %u -> %u\n", h, (unsigned)(DWORD)brain, patched, (unsigned)from, (unsigned)to);
+	}
+}
+
+static void set_dual_input(int on) {
+	DWORD* p0 = pad_manager_pad(0);
+	DWORD* p1 = pad_manager_pad(1);
+	if (!p0 || !p1) {
+		twop_log("[DUAL] pad objects missing\n");
+		return;
+	}
+	if (on == dual_input_enabled)
+		return;
+
+	if (on) {
+		p1[0x70 / 4] = p0[0x70 / 4];   // same controller index as pad 0
+		p1[0x88 / 4] = 0;              // "connected"
+		p1[0x8C / 4] = 0;
+		dual_input_enabled = 1;
+		patch_extra_hero_ids(0xF4240u, 0xF4241u);
+	}
+	else {
+		dual_input_enabled = 0;
+		patch_extra_hero_ids(0xF4241u, 0xF4240u);
+		p1[0x88 / 4] = 1;
+		p1[0x8C / 4] = 1;
+	}
+	twop_log("[DUAL] dual input %s (pad 1: +0x70=%d +0x88=%d)\n", on ? "ON" : "OFF", (int)p1[0x70 / 4], (int)p1[0x88 / 4]);
+}
+
+/*
+ * ---- unique names for extra heroes and their cameras ---------------------------------------
+ * add_player builds the entity name from the literal "HERO" (0x88A9D0) and the camera name from
+ * "CHASE_CAM" (0x88A988); only for player numbers >= 1 does it append the number. We go through the
+ * player-0 path, so every extra hero would be called "HERO" and every extra camera "CHASE_CAM", the
+ * same as player 1's. The game looks things up by name in 43 places, so duplicates make P1's code
+ * find P2. The two call sites that assign those literals (0x55B6A2, 0x55B863) are hooked to hand
+ * over the names the game itself would use ("HERO1", "CHASE_CAM1", ...) while an extra hero spawns.
+ */
+typedef void(__fastcall* mstring_assign_cstr_ptr)(void* this, void* edx, const char* src);
+mstring_assign_cstr_ptr mstring_assign_cstr_original = (void*)0x0041FE30;
+char extra_hero_name[16] = "HERO1";
+char extra_cam_name[24] = "CHASE_CAM1";
+int naming_active = 0;
+
+void __fastcall add_player_name_hook(void* this, void* edx, const char* src) {
+	if (naming_active) {
+		if (src == (const char*)0x0088A9D0)
+			src = extra_hero_name;
+		else if (src == (const char*)0x0088A988)
+			src = extra_cam_name;
+	}
+	mstring_assign_cstr_original(this, edx, src);
+}
+
+void install_add_player_name_hooks(void) {
+	HookFunc(0x0055B6A2, add_player_name_hook, 0, "Hooking add_player's hero name assignment");
+	HookFunc(0x0055B863, add_player_name_hook, 0, "Hooking add_player's camera name assignment");
+}
+
+/*
+ * ---- P2 indicator and "bring P2 to me" ----------------------------------------------------
+ * Objects keep a 4x4 matrix pointer at +0x14: rows x, y, z axes and the translation at +0x30
+ * (floats 12..14). When bit 28 of the dword at +8 is set the game refreshes it first (0x4DB590).
+ * The indicator uses the main camera's matrix if it passes a sanity check, and works out which
+ * way is "forward" from where player 1 is relative to the camera.
+ */
+typedef void(__fastcall* entity_update_po_ptr)(void* this, void* edx, int one);
+
+static float* entity_po(DWORD* ent) {
+	if (!ent)
+		return NULL;
+	if ((ent[2] >> 0x1C) & 1)
+		((entity_update_po_ptr)0x004DB590)(ent, NULL, 1);
+	return (float*)ent[0x14 / 4];
+}
+
+static int po_looks_valid(float* po) {
+	if (!po)
+		return 0;
+	for (int r = 0; r < 3; r++) {
+		float l = po[r * 4] * po[r * 4] + po[r * 4 + 1] * po[r * 4 + 1] + po[r * 4 + 2] * po[r * 4 + 2];
+		if (!(l > 0.8f && l < 1.2f))   // also rejects NaN
+			return 0;
+	}
+	return 1;
+}
+
+void draw_p2_indicator(void) {
+	static int frame = 0;
+	static int logs = 0;
+
+	if (!dual_input_enabled || !extra_hero_count)
+		return;
+	frame++;
+
+	DWORD* world = *(DWORD**)g_world_ptr;
+	if (!world)
+		return;
+	DWORD* hero0 = (DWORD*)world[0x230 / 4];
+	DWORD* hero2 = extra_heroes[0];
+	if (!hero0 || !hero2)
+		return;
+
+	__try {
+		float* p1 = entity_po(hero0);
+		float* p2 = entity_po(hero2);
+		if (!p1 || !p2)
+			return;
+
+		float dx = p2[12] - p1[12], dy = p2[13] - p1[13], dz = p2[14] - p1[14];
+		float dist = sqrtf(dx * dx + dy * dy + dz * dz);
+
+		float sx = 320.f, sy = 60.f;
+		int have_dir = 0;
+		float right = 0, up = 0, fwd = 0;
+		int cam_ok = 0;
+		float fwd_sign = 1.f;
+
+		DWORD* main_cam = *(DWORD**)0x00959A70;
+		float* cam = main_cam ? (float*)main_cam[0x14 / 4] : NULL;
+		if (cam && po_looks_valid(cam)) {
+			cam_ok = 1;
+			// forward = whichever sign of the z axis points from the camera to player 1
+			float tx = p1[12] - cam[12], ty = p1[13] - cam[13], tz = p1[14] - cam[14];
+			if (tx * cam[8] + ty * cam[9] + tz * cam[10] < 0.f)
+				fwd_sign = -1.f;
+
+			right = dx * cam[0] + dy * cam[1] + dz * cam[2];
+			up = dx * cam[4] + dy * cam[5] + dz * cam[6];
+			fwd = fwd_sign * (dx * cam[8] + dy * cam[9] + dz * cam[10]);
+			have_dir = 1;
+
+			if (fwd > 1.f) {
+				// in front of the camera: rough perspective projection (field of view is a guess)
+				sx = 320.f + 320.f * (right / fwd) / 0.9f;
+				sy = 240.f - 240.f * (up / fwd) / 0.7f;
+			}
+			else {
+				// beside or behind: put the marker on the screen edge in that direction
+				float len = sqrtf(right * right + up * up) + 0.001f;
+				sx = 320.f + (right / len) * 1000.f;
+				sy = 240.f - (up / len) * 1000.f;
+				if (len < 0.5f)
+					sy = 1000.f;
+			}
+		}
+
+		if (sx < 50.f) sx = 50.f;
+		if (sx > 540.f) sx = 540.f;
+		if (sy < 60.f) sy = 60.f;
+		if (sy > 410.f) sy = 410.f;
+
+		char label[64];
+		const char* arrow = "";
+		if (have_dir) {
+			if (sx <= 60.f) arrow = "<";
+			else if (sx >= 530.f) arrow = ">";
+			else if (sy <= 70.f) arrow = "^";
+			else if (sy >= 400.f) arrow = "v";
+		}
+		if (sx >= 530.f)
+			sprintf(label, "P2 %dm %s", (int)dist, arrow);
+		else
+			sprintf(label, "%s P2 %dm", arrow, (int)dist);
+
+		nglListAddString(*nglSysFont, sx, sy, 0.2f, nglColor(255, 220, 0, 255), 1.f, 1.f, "%s", label);
+
+		if (logs < 6 && frame % 180 == 0) {
+			logs++;
+			twop_log("[IND] dist %.1f d=(%.1f %.1f %.1f) camera_ok=%d fwd_sign=%.0f right=%.1f up=%.1f fwd=%.1f -> screen (%.0f, %.0f)\n",
+				dist, dx, dy, dz, cam_ok, fwd_sign, right, up, fwd, sx, sy);
+		}
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		static int faulted = 0;
+		if (!faulted) {
+			faulted = 1;
+			twop_log("[IND] indicator faulted, disabled for this frame\n");
+		}
+	}
+}
+
+// F8: put every extra hero next to player 1
+static void bring_extra_heroes_to_p1(void) {
+	DWORD* world = *(DWORD**)g_world_ptr;
+	DWORD* hero0 = world ? (DWORD*)world[0x230 / 4] : NULL;
+	if (!hero0 || !extra_hero_count) {
+		twop_log("[TP] nothing to do\n");
+		return;
+	}
+	__try {
+		float* po = entity_po(hero0);
+		float m[16];
+		if (!po)
+			return;
+		for (int i = 0; i < extra_hero_count; i++) {
+			memcpy(m, po, sizeof(m));
+			m[12] += 1.5f * (i + 1);   // small sideways offset so heroes don't overlap
+			((void(*)(DWORD, float*, int))0x004F3890)((DWORD)extra_heroes[i], m, 1);
+			twop_log("[TP] extra hero %d moved next to player 1\n", i);
+		}
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		twop_log("[TP] fault while teleporting\n");
+	}
+}
+
+/*
+ * ---- who is asking? (context resolution for "the hero" lookups) ---------------------------
+ * The game finds "the hero" through globals: get_hero(player) at 0x514A50 (77 call sites, which
+ * only returns [0x96F7B4] if set, otherwise player 0's hero) and name lookups for "HERO". Neither
+ * knows which hero's code is calling, so when player 2 swings, player 2's swing code gets player 1
+ * and moves him. Heuristic: scan the call stack for pointers into a hero's own objects (the entity
+ * itself, or anything inside its 0x424-byte brain). The innermost match is the hero whose code is
+ * running. If it is an extra hero, the lookup returns that hero instead of player 1.
+ * F7 toggles this on and off.
+ */
+int context_mode = 1;
+int context_logs = 0;
+
+static int try_read_cstr(const char* p, char* out, int n) {
+	int len = 0;
+	if (!p)
+		return 0;
+	__try {
+		while (len < n - 1 && p[len] >= 32 && p[len] < 127)
+			len++;
+		if (len > 0 && p[len] == 0) {
+			memcpy(out, p, len);
+			out[len] = 0;
+			return 1;
+		}
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+	}
+	return 0;
+}
+
+// the lookup's name argument may be an mString (pointer at +8, or the text inline at +12) or a plain char*
+static void decode_mstring(void* m, char* out, int n) {
+	DWORD ptr_at_8 = 0;
+	strcpy(out, "?");
+	__try {
+		ptr_at_8 = *(DWORD*)((BYTE*)m + 8);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		ptr_at_8 = 0;
+	}
+	if (try_read_cstr((const char*)ptr_at_8, out, n))
+		return;
+	if (try_read_cstr((const char*)m + 12, out, n))
+		return;
+	try_read_cstr((const char*)m, out, n);
+}
+
+static DWORD* context_hero_from_stack(const char* why, DWORD caller) {
+	NT_TIB* tib = (NT_TIB*)NtCurrentTeb();
+	DWORD* sp = (DWORD*)_AddressOfReturnAddress();
+	DWORD* top = (DWORD*)tib->StackBase;
+	DWORD* world = *(DWORD**)g_world_ptr;
+	DWORD* hero0 = world ? (DWORD*)world[0x230 / 4] : NULL;
+	DWORD hero0_brain = hero0 ? hero0[0x8C / 4] : 0;
+
+	__try {
+		for (int n = 0; sp + n < top && n < 1024; n++) {
+			DWORD v = sp[n];
+			if (v < 0x10000)
+				continue;
+
+			if (hero0 && (v == (DWORD)hero0 || (hero0_brain && v >= hero0_brain && v < hero0_brain + 0x424)))
+				return NULL;   // innermost owner is player 1
+
+			for (int i = 0; i < extra_hero_count; i++) {
+				DWORD brain = extra_heroes[i][0x8C / 4];
+				if (v == (DWORD)extra_heroes[i] || (brain && v >= brain && v < brain + 0x424)) {
+					if (context_logs < 40) {
+						context_logs++;
+						twop_log("[CTX] %s from %08X: stack owner is extra hero %d (value %08X at +0x%X) -> using it\n",
+							why, (unsigned)caller, i, (unsigned)v, n * 4);
+					}
+					return extra_heroes[i];
+				}
+			}
+		}
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+	}
+	return NULL;
+}
+
+typedef DWORD*(__fastcall* get_hero_ptr)(void* this, void* edx, int idx);
+get_hero_ptr get_hero_original = (void*)0x00514A50;
+
+DWORD* __fastcall get_hero_hook(void* this, void* edx, int idx) {
+	DWORD* r = get_hero_original(this, edx, idx);
+
+	if (context_mode && dual_input_enabled && extra_hero_count && idx == 0 && r) {
+		DWORD* world = *(DWORD**)g_world_ptr;
+		DWORD* hero0 = world ? (DWORD*)world[0x230 / 4] : NULL;
+		if (r == hero0) {
+			DWORD* ctx = context_hero_from_stack("get_hero(0)", (DWORD)_ReturnAddress());
+			if (ctx)
+				return ctx;
+		}
+	}
+	return r;
+}
+
+static const DWORD get_hero_sites[] = {
+	0x004495DE, 0x004501C2, 0x00457C34, 0x00458F43, 0x0046DA8F, 0x0046DB15, 0x0046DB5A, 0x00473B4B,
+	0x0047584C, 0x00475B53, 0x00475C17, 0x0047A86D, 0x004829DD, 0x0049D0D3, 0x004E7338, 0x004EA9BB,
+	0x004EAA92, 0x004EAEAF, 0x004F9C2F, 0x005403C4, 0x00552D36, 0x0057B0AB, 0x0057B42E, 0x0057FBB0,
+	0x0059B339, 0x0059B376, 0x005BB97F, 0x00619295, 0x00619326, 0x006193DC, 0x00619EC2, 0x00641FFC,
+	0x00642146, 0x0064245C, 0x006425A6, 0x0066281A, 0x0066287A, 0x006628DA, 0x0066293A, 0x00665A98,
+	0x00679053, 0x00679098, 0x006796C6, 0x0067970F, 0x00687CF8, 0x0068F761, 0x006B9B7A, 0x006B9DF3,
+	0x006BBA1D, 0x006BC15C, 0x006BC198, 0x006C2F0E, 0x006C7AD3, 0x006C81B2, 0x006C9A19, 0x006CA351,
+	0x006CACCA, 0x006CD1F4, 0x006CFF55, 0x006D05B5, 0x006D1820, 0x006D1B85, 0x006D2EEF, 0x006D2F10,
+	0x006D2F4D, 0x006D3359, 0x006D4B88, 0x006D62AA, 0x006D8077, 0x006DA55C, 0x00714859, 0x00714885,
+	0x00731147, 0x00731768, 0x007334CD, 0x0073A260, 0x0073CBA5
+};
+
+void install_get_hero_hooks(void) {
+	int n = (int)(sizeof(get_hero_sites) / sizeof(get_hero_sites[0]));
+	for (int i = 0; i < n; i++)
+		HookFunc(get_hero_sites[i], get_hero_hook, 0, "Hooking a get_hero call site (context resolution)");
+	twop_log("[CTX] get_hero context resolution installed on %d call sites\n", n);
+}
+
+/*
+ * ---- camera fix: extra heroes must not steal the view -------------------------------------
+ * add_player gives every hero a chase camera object named "CHASE_CAM". The camera manager
+ * (0x54F8C0 mode switch, 0x552F50 per-frame update) finds its cameras BY NAME with
+ * 0x004DC300(name, 0x1D, 0). Extra heroes created through the count == 0 path also get the plain
+ * name, so a lookup can return an extra hero's camera and the view jumps to that hero (seen when
+ * player 2 web zips). We hook every call site of the lookup and, when it returns one of the extra
+ * heroes' cameras, return the main camera ([0x959A70], player 1's) instead.
+ */
+typedef DWORD*(__cdecl* find_entity_by_name_ptr)(void* name, int type, int flag);
+find_entity_by_name_ptr find_entity_by_name_original = (void*)0x004DC300;
+#define LOOKUP_NAMES_MAX 48
+char lookup_names_seen[LOOKUP_NAMES_MAX][40];
+int lookup_names_count = 0;
+
+DWORD* __cdecl find_entity_by_name_hook(void* name, int type, int flag) {
+	DWORD* r = find_entity_by_name_original(name, type, flag);
+
+	if (!r || !extra_hero_count)
+		return r;
+
+	DWORD* main_cam = *(DWORD**)0x00959A70;
+	DWORD* world = *(DWORD**)g_world_ptr;
+	DWORD* hero0 = world ? (DWORD*)world[0x230 / 4] : NULL;
+	int is_extra_cam = 0;
+	int hero_kind = 0;   // 1 = extra hero, 2 = hero 0
+	char nm[40];
+	int have_name = 0;
+
+	for (int i = 0; i < extra_cam_count; i++)
+		if (r == extra_cams[i])
+			is_extra_cam = 1;
+	for (int i = 0; i < extra_hero_count; i++)
+		if (r == extra_heroes[i])
+			hero_kind = 1;
+	if (r == hero0)
+		hero_kind = 2;
+
+	if (is_extra_cam || hero_kind == 2 || lookup_names_count < LOOKUP_NAMES_MAX) {
+		decode_mstring(name, nm, sizeof(nm));
+		have_name = 1;
+	}
+
+	// log every distinct requested name once, to see what the game's code asks for
+	if (have_name && lookup_names_count < LOOKUP_NAMES_MAX) {
+		int known = 0;
+		for (int i = 0; i < lookup_names_count; i++)
+			if (!strcmp(lookup_names_seen[i], nm))
+				known = 1;
+		if (!known) {
+			strcpy(lookup_names_seen[lookup_names_count++], nm);
+			twop_log("[LOOKUP] '%s' type %d from %08X -> %08X%s%s\n", nm, type, (unsigned)(DWORD)_ReturnAddress(), (unsigned)(DWORD)r,
+				is_extra_cam ? " (EXTRA CAMERA)" : "", hero_kind == 2 ? " (hero 0)" : hero_kind == 1 ? " (EXTRA HERO)" : "");
+		}
+	}
+
+	if (is_extra_cam && type == 0x1D && main_cam)
+		return main_cam;
+
+	// code running on an extra hero's own objects that asks for "HERO" gets that hero, not player 1
+	if (hero_kind == 2 && context_mode && dual_input_enabled && have_name && !_stricmp(nm, "HERO")) {
+		DWORD* ctx = context_hero_from_stack("lookup 'HERO'", (DWORD)_ReturnAddress());
+		if (ctx)
+			return ctx;
+	}
+	return r;
+}
+
+static const DWORD find_entity_sites[] = {
+	0x004B64FC, 0x004DCE59, 0x004DCE7A, 0x004DCEAA, 0x004DD55C, 0x0050B9D9, 0x00528BE3, 0x0054AE19,
+	0x0054F800, 0x0054F95D, 0x0054FA08, 0x0054FA29, 0x0054FB8D, 0x0054FBAE, 0x005531EC, 0x0055320C,
+	0x005533EE, 0x0055D23E, 0x0057840C, 0x005A37F2, 0x005B85A9, 0x005BB1D1, 0x005DD9D5, 0x0065EFBE,
+	0x0065F035, 0x0065F455, 0x00660455, 0x00660945, 0x00660A65, 0x00668BC0, 0x00668C1D, 0x006A5C90,
+	0x006AA7FB, 0x006AA897, 0x006DF8EB, 0x00707FDE, 0x00708022, 0x0071BE71, 0x0071BEC8, 0x0071BFF0,
+	0x0072AA3B, 0x0072ADF9, 0x0072F74D
+};
+
+void install_camera_lookup_fix(void) {
+	int n = (int)(sizeof(find_entity_sites) / sizeof(find_entity_sites[0]));
+	for (int i = 0; i < n; i++)
+		HookFunc(find_entity_sites[i], find_entity_by_name_hook, 0, "Hooking a find-entity-by-name call site (camera fix)");
+	twop_log("[CAM] camera lookup fix installed on %d call sites\n", n);
+}
+
+/*
+ * ---- control read probe (logging only) ----------------------------------------------------
+ * Every control read in the game goes through 0x00821E90 (get_control_value(array, id) -> float).
+ * There are 31 call sites. We hook all of them and log, once per (call site, id), any read that
+ * returns a non-trivial value, i.e. while you hold a key. This shows which code reads the movement
+ * controls and which controller object (`this`) it reads from.
+ */
+typedef float(__fastcall* get_control_value_ptr)(void* this, void* edx, unsigned id);
+get_control_value_ptr get_control_value_original = (void*)0x00821E90;
+
+#define CONTROL_PROBE_MAX 64
+DWORD control_probe_caller[CONTROL_PROBE_MAX];
+unsigned control_probe_id[CONTROL_PROBE_MAX];
+int control_probe_count = 0;
+
+float __fastcall get_control_value_hook(void* this, void* edx, unsigned id) {
+	float v = get_control_value_original(this, edx, id);
+
+	if ((v > 0.3f || v < -0.3f) && control_probe_count < CONTROL_PROBE_MAX) {
+		DWORD caller = (DWORD)_ReturnAddress();
+		int known = 0;
+		for (int i = 0; i < control_probe_count; i++)
+			if (control_probe_caller[i] == caller && control_probe_id[i] == id)
+				known = 1;
+		if (!known) {
+			control_probe_caller[control_probe_count] = caller;
+			control_probe_id[control_probe_count] = id;
+			control_probe_count++;
+			twop_log("[CTL] read from %08X: this=%08X id=%u value=%.2f\n", (unsigned)caller, (unsigned)(DWORD)this, id, v);
+		}
+	}
+	return v;
+}
+
+static const DWORD control_read_sites[] = {
+	0x00473B91, 0x00473BAA, 0x00473BC4, 0x005A507D, 0x005A50B4, 0x005A50E6, 0x005AD4CA,
+	0x0081D288, 0x0081D29E, 0x0081D2D0, 0x0081D2E6, 0x0081D318, 0x0081D32E, 0x0081D360,
+	0x0081D376, 0x0081D3A8, 0x0081D3BF, 0x0081D3D6, 0x0081D3ED, 0x0081D404, 0x0081D41B,
+	0x0081D432, 0x0081D449, 0x0081D460, 0x0081D47F, 0x0081D49A, 0x0081D4B5, 0x0081D4D0,
+	0x0081D4EB, 0x0081D506, 0x0081D521
+};
+
+void install_control_read_probe(void) {
+	for (int i = 0; i < (int)(sizeof(control_read_sites) / sizeof(control_read_sites[0])); i++)
+		HookFunc(control_read_sites[i], get_control_value_hook, 0, "Hooking a get_control_value call site (probe)");
+	twop_log("[CTL] control read probe installed on %d call sites\n", (int)(sizeof(control_read_sites) / sizeof(control_read_sites[0])));
+}
+
+/*
+ * ---- input probe (logging only, changes no behaviour) -------------------------------------
+ * What the exe shows:
+ *   - 0x987948 is the input manager. It holds 10 raw gamepad states (stride 0x110) and an
+ *     array of controller object pointers at mgr+0x129D8 (element count at mgr+0x129D0).
+ *   - The game only ever fills slot 0 (every call to set_controller 0x8203F0 passes index 0).
+ *   - The hero input function (0x00473650, vtable slot at 0x00877498) reads its movement
+ *     controls (ids 0x10, 0x12, 0x13) from controllers[0]+0x18 via the getter 0x821E90.
+ * The probe logs the controller table, and every distinct `this` that reaches the hero input
+ * function, so we can see how to tell hero 2's call apart from hero 1's.
+ */
+typedef int(__fastcall* get_gamepad_count_ptr)(void* this);
+get_gamepad_count_ptr get_gamepad_count = (void*)0x00820080;
+
+static void log_input_state(const char* when) {
+	DWORD mgr = *(DWORD*)0x00987948;
+	twop_log("[IN] ---- input state (%s) ----\n", when);
+	if (!mgr) {
+		twop_log("[IN] no input manager\n");
+		return;
+	}
+	twop_log("[IN] manager %08X, controller slot count %u, gamepads detected %d\n",
+		(unsigned)mgr, (unsigned)*(DWORD*)(mgr + 0x129D0), get_gamepad_count((void*)mgr));
+	for (int i = 0; i < 4; i++)
+		twop_log("[IN]   controllers[%d] = %08X\n", i, (unsigned)*(DWORD*)(mgr + 0x129D8 + i * 4));
+	twop_log("[IN] controller globals: 965C0C=%08X 965C10=%08X 965C14=%08X 965C1C=%08X\n",
+		(unsigned)*(DWORD*)0x00965C0C, (unsigned)*(DWORD*)0x00965C10,
+		(unsigned)*(DWORD*)0x00965C14, (unsigned)*(DWORD*)0x00965C1C);
+	DWORD c0 = *(DWORD*)(mgr + 0x129D8);
+	if (c0)
+		twop_log("[IN] controllers[0]: vtable %08X, control count (+0x18) %u\n", (unsigned)*(DWORD*)c0, (unsigned)*(DWORD*)(c0 + 0x18));
+}
+
+typedef void(__fastcall* hero_input_fn_ptr)(void* this, void* edx, int arg);
+hero_input_fn_ptr hero_input_fn_original = (void*)0x00473650;
+
+DWORD probe_seen[16];
+int probe_seen_count = 0;
+
+void __fastcall hero_input_fn_hook(void* this, void* edx, int arg) {
+	int known = 0;
+	for (int i = 0; i < probe_seen_count; i++)
+		if (probe_seen[i] == (DWORD)this) known = 1;
+
+	if (!known && probe_seen_count < 16) {
+		DWORD* t = (DWORD*)this;
+		DWORD* world = *(DWORD**)g_world_ptr;
+		probe_seen[probe_seen_count++] = (DWORD)this;
+		twop_log("[IN] hero input fn: new this=%08X vtbl=%08X [+0x14]=%08X [+0x50]=%08X [+0x8C]=%08X  (hero0 entity=%08X, last extra hero=%08X)\n",
+			(unsigned)(DWORD)this, (unsigned)t[0], (unsigned)t[0x14 / 4], (unsigned)t[0x50 / 4], (unsigned)t[0x8C / 4],
+			(unsigned)(world ? world[0x230 / 4] : 0), (unsigned)(DWORD)second_hero_entity);
+	}
+	hero_input_fn_original(this, edx, arg);
+}
+
+// the function is only reached through a vtable slot, so patch the slot itself
+void install_hero_input_probe(void) {
+	DWORD* slot = (DWORD*)0x00877498;
+	DWORD old;
+	if (*slot != 0x00473650) {
+		puts("[IN] vtable slot 0x877498 does not hold 0x473650, probe not installed");
+		return;
+	}
+	if (VirtualProtect(slot, 4, PAGE_READWRITE, &old)) {
+		*slot = (DWORD)hero_input_fn_hook;
+		VirtualProtect(slot, 4, old, &old);
+		puts("[IN] hero input probe installed");
+	}
+}
+
+/*
+ * add_player calls 0x0055A420 (at 0x0055B44E) only for player 0. It copies the costume name
+ * into the game state and asks the streamer to load that character's pack. Both logged crashes
+ * happen after/inside this path while a first hero is already loaded, so for the second hero we
+ * skip the request and reuse the resident pack (same character as the first hero).
+ */
+DWORD skip_pack_load = 0;
+
+typedef void(__fastcall* load_hero_pack_ptr)(void* this, void* edx, char* name, int flag);
+load_hero_pack_ptr load_hero_pack_original = (void*)0x0055A420;
+
+void __fastcall load_hero_pack_hook(void* this, void* edx, char* name, int flag) {
+	if (skip_pack_load) {
+		twop_log("[2P] skipped pack-load request for '%s' (flag %d)\n", name ? name : "(null)", flag);
+		return;
+	}
+	load_hero_pack_original(this, edx, name, flag);
+}
+
+static void spawn_second_hero(const char* costume) {
+
+	DWORD* world = *(DWORD**)g_world_ptr;
+	DWORD* hero0 = (DWORD*)world[0x230 / 4];
+
+	DWORD* game_state_obj = *(DWORD**)0x009682E0;
+	BYTE* name_buf = NULL;
+	BYTE saved_name[32];
+	DWORD saved_global = *(DWORD*)0x00959A70;
+
+	if (!hero0) {
+		twop_log("[2P] no existing hero, aborting\n");
+		return;
+	}
+
+	if (game_state_obj) {
+		name_buf = (BYTE*)(*(DWORD*)((BYTE*)game_state_obj + 0xC0)) + 0x454;
+		memcpy(saved_name, name_buf, sizeof(saved_name));
+	}
+
+	// shadow world: intentionally leaked (2KB), never freed in case the engine keeps a pointer
+	BYTE* shadow = calloc(1, 0x800);
+	panic(shadow);
+
+	((DWORD*)shadow)[0x230 / 4] = (DWORD)hero0;        // spawn reference = existing hero
+	((DWORD*)shadow)[0x234 / 4] = world[0x234 / 4];
+	((DWORD*)shadow)[0x238 / 4] = 0;                   // "no players yet"
+	mString_constructor((mString*)(shadow + 0x3E0), NULL, "");
+
+	twop_log("[2P] ---- new attempt ----\n");
+	twop_log("[2P] world %08X, real player count %u, hero0 entity %08X\n",
+		(unsigned)(DWORD)world, (unsigned)world[0x238 / 4], (unsigned)(DWORD)hero0);
+	if (name_buf) {
+		char shown[33];
+		memcpy(shown, saved_name, 32);
+		shown[32] = 0;
+		twop_log("[2P] current hero name in game state: '%s'\n", shown);
+	}
+	if (name_buf) {
+		char current[33];
+		memcpy(current, saved_name, 32);
+		current[32] = 0;
+		if (strcmp(costume, current) != 0) {
+			twop_log("[2P] '%s' is not the loaded character pack; spawning '%s' instead (a different pack can't be loaded yet)\n", costume, current);
+			strcpy(second_costume, current);
+			costume = second_costume;
+		}
+	}
+	twop_log("[2P] spawning '%s' via shadow world %08X\n", costume, (unsigned)(DWORD)shadow);
+
+	mString name;
+	mString_constructor(&name, NULL, (char*)costume);
+
+	int ok = 1;
+	sprintf(extra_hero_name, "HERO%d", extra_hero_count + 1);
+	sprintf(extra_cam_name, "CHASE_CAM%d", extra_hero_count + 1);
+	twop_log("[2P] naming the new hero '%s' and its camera '%s'\n", extra_hero_name, extra_cam_name);
+	// Everything add_player registers (the brain's 19 sub-objects, listeners, threads) is stamped with the
+	// script owner id [[0x9685DC]+0x58], which is pad 0's id (1000000). Create the extra hero as owner
+	// 1000001 (pad 1) so it listens on pad 1's channel from the start.
+	DWORD* vm = *(DWORD**)0x009685DC;
+	DWORD saved_owner = vm ? vm[0x58 / 4] : 0;
+	if (vm) {
+		twop_log("[2P] script owner id was %u, creating the hero as owner %u (pad 1)\n", (unsigned)saved_owner, 0xF4241u);
+		vm[0x58 / 4] = 0xF4241u;
+	}
+	naming_active = 1;
+	skip_pack_load = 1;
+	__try {
+		world_dynamics_system_add_player(shadow, NULL, &name);
+	}
+	__except (second_hero_filter(GetExceptionInformation())) {
+		ok = 0;
+	}
+	skip_pack_load = 0;
+	naming_active = 0;
+	if (vm)
+		vm[0x58 / 4] = saved_owner;
+
+	mString_finalize(&name, NULL, 0);
+
+	// put back the global state the count == 0 path overwrote
+	if (name_buf)
+		memcpy(name_buf, saved_name, sizeof(saved_name));
+	*(DWORD*)0x00959A70 = saved_global;
+
+	DWORD new_count = ((DWORD*)shadow)[0x238 / 4];
+	DWORD* new_hero = (DWORD*)((DWORD*)shadow)[0x230 / 4];
+	DWORD* new_ctrl = (DWORD*)((DWORD*)shadow)[0x234 / 4];
+
+	if (!ok || new_count != 1 || new_hero == hero0) {
+		twop_log("[2P] FAILED (ok=%d, shadow count=%u, new hero=%08X)\n",
+			ok, (unsigned)new_count, (unsigned)(DWORD)new_hero);
+		return;
+	}
+
+	second_hero_entity = new_hero;
+	second_hero_ctrl = new_ctrl;
+	if (extra_hero_count < 16)
+		extra_heroes[extra_hero_count++] = new_hero;
+	if (extra_cam_count < 16)
+		extra_cams[extra_cam_count++] = new_ctrl;
+	if (!dual_input_enabled)
+		set_dual_input(1);   // first extra hero: bring pad 1 to life (keyboard+mouse = P1, controller = P2)
+	else
+		patch_extra_hero_ids(0xF4240u, 0xF4241u);
+	{
+		DWORD* brain = (DWORD*)new_hero[0x8C / 4];
+		twop_log("[2P] extra hero entity vtable %08X, brain object %08X, brain player index %d\n",
+			(unsigned)new_hero[0], (unsigned)(DWORD)brain, brain ? (int)brain[0x14 / 4] : -1);
+	}
+	log_input_state("after spawning extra hero");
+	log_pads();
+	scan_hero_for_pads("hero0", hero0);
+	scan_hero_for_pads("extra", new_hero);
+	twop_log("[2P] SUCCESS: second hero entity %08X, controller object %08X\n",
+		(unsigned)(DWORD)new_hero, (unsigned)(DWORD)new_ctrl);
+}
 
 
 typedef (*entity_teleport_abs_po_ptr)(DWORD, float*, int one);
@@ -1155,8 +2131,10 @@ HRESULT __stdcall GetDeviceStateHook(IDirectInputDevice8* this, DWORD cbData, LP
 		
 		if (cbData == 256)
 			GetDeviceStateHandleKeyboardInput(lpvData);
-		else if (cbData == sizeof(DIJOYSTATE2))
+		else if (cbData == sizeof(DIJOYSTATE2)) {
 			GetDeviceStateHandleControllerInput(lpvData);
+			log_joy_sample((LPDIJOYSTATE2)lpvData);
+		}
 
 		int game_state = 0;
 		if (g_game_ptr)
@@ -1176,6 +2154,25 @@ HRESULT __stdcall GetDeviceStateHook(IDirectInputDevice8* this, DWORD cbData, LP
 
 	if (debug_enabled) {
 		memset(lpvData, 0, cbData);
+	}
+
+	if (dual_input_enabled && SUCCEEDED(res)) {
+		if (cbData == 256) {
+			if (input_pass == 1)
+				memset(lpvData, 0, 256);
+		}
+		else if (cbData == sizeof(DIJOYSTATE2)) {
+			if (input_pass == 0) {
+				LPDIJOYSTATE2 j = (LPDIJOYSTATE2)lpvData;
+				memset(j, 0, sizeof(*j));
+				for (int i = 0; i < 4; i++)
+					j->rgdwPOV[i] = 0xFFFFFFFF;
+			}
+		}
+		else if (cbData == sizeof(DIMOUSESTATE2) || cbData == sizeof(DIMOUSESTATE)) {
+			if (input_pass == 1)
+				memset(lpvData, 0, cbData);
+		}
 	}
 
 
@@ -1307,6 +2304,27 @@ int __fastcall game_handle_game_states(void* this, void* edx, void* a2) {
 			mString_constructor(&str, NULL, current_costume);
 			world_dynamics_system_add_player(*(DWORD**)g_world_ptr, NULL, &str);
 			mString_finalize(&str, NULL, 0);
+			game_unpause(g_game_ptr);
+		}
+	}
+
+	if (GetAsyncKeyState(VK_F9) & 1)
+		set_dual_input(1);
+	if (GetAsyncKeyState(VK_F10) & 1)
+		set_dual_input(0);
+	if (GetAsyncKeyState(VK_F8) & 1)
+		bring_extra_heroes_to_p1();
+	if (GetAsyncKeyState(VK_F7) & 1) {
+		context_mode = !context_mode;
+		twop_log("[CTX] context resolution %s\n", context_mode ? "ON" : "OFF");
+	}
+
+	if (adding_second_player) {
+
+		adding_second_player--;
+
+		if (!adding_second_player) {
+			spawn_second_hero(second_costume);
 			game_unpause(g_game_ptr);
 		}
 	}
@@ -1874,6 +2892,13 @@ void install_patches() {
 
 	HookFunc(0x00421128, sub_41F9D0_hook, 0, "Hooking sub_41F9D0");
 
+	HookFunc(0x0055B44E, load_hero_pack_hook, 0, "Hooking add_player's call to the hero pack loader (2nd player experiment)");
+	install_control_read_probe();
+	install_pad_update_hook();
+	install_camera_lookup_fix();
+	install_add_player_name_hooks();
+	install_get_hero_hooks();
+
 
 	/*
 	WriteDWORD(0x00877524, ai_hero_base_state_check_transition_hook, "Hooking check_transition for peter hooded");
@@ -1984,6 +3009,23 @@ void handle_char_select_entry(debug_menu_entry* entry) {
 }
 
 
+void handle_add_player_select_entry(debug_menu_entry* entry) {
+
+	DWORD* player_count = (*(DWORD**)g_world_ptr) + 142;
+
+	if (!*player_count) {
+		twop_log("[2P] no existing player, load into the game world first\n");
+		return;
+	}
+
+	strncpy(second_costume, entry->text, sizeof(second_costume) - 1);
+	second_costume[sizeof(second_costume) - 1] = 0;
+
+	debug_enabled = 0;
+	adding_second_player = 2;
+}
+
+
 void handle_options_select_entry(debug_menu_entry* entry) {
 
 	BYTE* val = entry->data;
@@ -2042,6 +3084,7 @@ void setup_debug_menu() {
 	script_menu = create_menu("Script", goto_start_debug, (menu_handler_function)handle_script_select_entry, 50);
 	progression_menu = create_menu("Progression", goto_start_debug, (menu_handler_function)handle_progression_select_entry, 10);
 	district_variants_menu = create_menu("District variants", goto_start_debug, (menu_handler_function)handle_distriction_variants_select_entry, 15);
+	add_player_menu = create_menu("Add 2nd Player", goto_start_debug, (menu_handler_function)handle_add_player_select_entry, 10);
 
 
 	debug_menu_entry warp_entry = { "Warp", NORMAL, warp_menu };
@@ -2050,10 +3093,12 @@ void setup_debug_menu() {
 	debug_menu_entry script_entry = { "Script", NORMAL, script_menu };
 	debug_menu_entry progression_entry = { "Progression", NORMAL, progression_menu };
 	debug_menu_entry district_entry = { "District variants", NORMAL, district_variants_menu };
+	debug_menu_entry add_player_entry = { "Add 2nd Player", NORMAL, add_player_menu };
 
 	add_debug_menu_entry(start_debug, &warp_entry);
 	add_debug_menu_entry(start_debug, &district_entry);
 	add_debug_menu_entry(start_debug, &char_select);
+	add_debug_menu_entry(start_debug, &add_player_entry);
 	add_debug_menu_entry(start_debug, &options_entry);
 	add_debug_menu_entry(start_debug, &script_entry);
 	add_debug_menu_entry(start_debug, &progression_entry);
@@ -2078,6 +3123,7 @@ void setup_debug_menu() {
 		strcpy(char_entry.text, costumes[i]);
 
 		add_debug_menu_entry(char_select_menu, &char_entry);
+		add_debug_menu_entry(add_player_menu, &char_entry);
 	}
 
 
