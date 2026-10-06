@@ -1179,6 +1179,117 @@ static void bring_extra_heroes_to_p1(void) {
 }
 
 /*
+ * ---- who is asking? (context resolution for "the hero" lookups) ---------------------------
+ * The game finds "the hero" through globals: get_hero(player) at 0x514A50 (77 call sites, which
+ * only returns [0x96F7B4] if set, otherwise player 0's hero) and name lookups for "HERO". Neither
+ * knows which hero's code is calling, so when player 2 swings, player 2's swing code gets player 1
+ * and moves him. Heuristic: scan the call stack for pointers into a hero's own objects (the entity
+ * itself, or anything inside its 0x424-byte brain). The innermost match is the hero whose code is
+ * running. If it is an extra hero, the lookup returns that hero instead of player 1.
+ * F7 toggles this on and off.
+ */
+int context_mode = 1;
+int context_logs = 0;
+
+static void decode_mstring(void* m, char* out, int n) {
+	strcpy(out, "?");
+	__try {
+		char* a = ((mString*)m)->actualString;
+		char* cands[2];
+		cands[0] = a;
+		cands[1] = (char*)m + 12;     // small strings live inline after the header
+		for (int c = 0; c < 2; c++) {
+			char* p = cands[c];
+			int len = 0;
+			if (!p)
+				continue;
+			while (len < n - 1 && p[len] >= 32 && p[len] < 127)
+				len++;
+			if (len > 0 && p[len] == 0) {
+				memcpy(out, p, len);
+				out[len] = 0;
+				return;
+			}
+		}
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+	}
+}
+
+static DWORD* context_hero_from_stack(const char* why, DWORD caller) {
+	NT_TIB* tib = (NT_TIB*)NtCurrentTeb();
+	DWORD* sp = (DWORD*)_AddressOfReturnAddress();
+	DWORD* top = (DWORD*)tib->StackBase;
+	DWORD* world = *(DWORD**)g_world_ptr;
+	DWORD* hero0 = world ? (DWORD*)world[0x230 / 4] : NULL;
+	DWORD hero0_brain = hero0 ? hero0[0x8C / 4] : 0;
+
+	__try {
+		for (int n = 0; sp + n < top && n < 1024; n++) {
+			DWORD v = sp[n];
+			if (v < 0x10000)
+				continue;
+
+			if (hero0 && (v == (DWORD)hero0 || (hero0_brain && v >= hero0_brain && v < hero0_brain + 0x424)))
+				return NULL;   // innermost owner is player 1
+
+			for (int i = 0; i < extra_hero_count; i++) {
+				DWORD brain = extra_heroes[i][0x8C / 4];
+				if (v == (DWORD)extra_heroes[i] || (brain && v >= brain && v < brain + 0x424)) {
+					if (context_logs < 40) {
+						context_logs++;
+						twop_log("[CTX] %s from %08X: stack owner is extra hero %d (value %08X at +0x%X) -> using it\n",
+							why, (unsigned)caller, i, (unsigned)v, n * 4);
+					}
+					return extra_heroes[i];
+				}
+			}
+		}
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+	}
+	return NULL;
+}
+
+typedef DWORD*(__fastcall* get_hero_ptr)(void* this, void* edx, int idx);
+get_hero_ptr get_hero_original = (void*)0x00514A50;
+
+DWORD* __fastcall get_hero_hook(void* this, void* edx, int idx) {
+	DWORD* r = get_hero_original(this, edx, idx);
+
+	if (context_mode && dual_input_enabled && extra_hero_count && idx == 0 && r) {
+		DWORD* world = *(DWORD**)g_world_ptr;
+		DWORD* hero0 = world ? (DWORD*)world[0x230 / 4] : NULL;
+		if (r == hero0) {
+			DWORD* ctx = context_hero_from_stack("get_hero(0)", (DWORD)_ReturnAddress());
+			if (ctx)
+				return ctx;
+		}
+	}
+	return r;
+}
+
+static const DWORD get_hero_sites[] = {
+	0x004495DE, 0x004501C2, 0x00457C34, 0x00458F43, 0x0046DA8F, 0x0046DB15, 0x0046DB5A, 0x00473B4B,
+	0x0047584C, 0x00475B53, 0x00475C17, 0x0047A86D, 0x004829DD, 0x0049D0D3, 0x004E7338, 0x004EA9BB,
+	0x004EAA92, 0x004EAEAF, 0x004F9C2F, 0x005403C4, 0x00552D36, 0x0057B0AB, 0x0057B42E, 0x0057FBB0,
+	0x0059B339, 0x0059B376, 0x005BB97F, 0x00619295, 0x00619326, 0x006193DC, 0x00619EC2, 0x00641FFC,
+	0x00642146, 0x0064245C, 0x006425A6, 0x0066281A, 0x0066287A, 0x006628DA, 0x0066293A, 0x00665A98,
+	0x00679053, 0x00679098, 0x006796C6, 0x0067970F, 0x00687CF8, 0x0068F761, 0x006B9B7A, 0x006B9DF3,
+	0x006BBA1D, 0x006BC15C, 0x006BC198, 0x006C2F0E, 0x006C7AD3, 0x006C81B2, 0x006C9A19, 0x006CA351,
+	0x006CACCA, 0x006CD1F4, 0x006CFF55, 0x006D05B5, 0x006D1820, 0x006D1B85, 0x006D2EEF, 0x006D2F10,
+	0x006D2F4D, 0x006D3359, 0x006D4B88, 0x006D62AA, 0x006D8077, 0x006DA55C, 0x00714859, 0x00714885,
+	0x00731147, 0x00731768, 0x007334CD, 0x0073A260, 0x0073CBA5
+};
+
+void install_get_hero_hooks(void) {
+	int n = (int)(sizeof(get_hero_sites) / sizeof(get_hero_sites[0]));
+	for (int i = 0; i < n; i++)
+		HookFunc(get_hero_sites[i], get_hero_hook, 0, "Hooking a get_hero call site (context resolution)");
+	twop_log("[CTX] get_hero context resolution installed on %d call sites\n", n);
+}
+
+/*
  * ---- camera fix: extra heroes must not steal the view -------------------------------------
  * add_player gives every hero a chase camera object named "CHASE_CAM". The camera manager
  * (0x54F8C0 mode switch, 0x552F50 per-frame update) finds its cameras BY NAME with
@@ -1196,48 +1307,52 @@ int lookup_names_count = 0;
 DWORD* __cdecl find_entity_by_name_hook(void* name, int type, int flag) {
 	DWORD* r = find_entity_by_name_original(name, type, flag);
 
-	if (extra_cam_count && r) {
-		DWORD* main_cam = *(DWORD**)0x00959A70;
-		DWORD* world = *(DWORD**)g_world_ptr;
-		DWORD* hero0 = world ? (DWORD*)world[0x230 / 4] : NULL;
-		int is_extra_cam = 0;
-		int hero_kind = 0;   // 1 = extra hero, 2 = hero 0
+	if (!r || !extra_hero_count)
+		return r;
 
-		for (int i = 0; i < extra_cam_count; i++)
-			if (r == extra_cams[i])
-				is_extra_cam = 1;
-		for (int i = 0; i < extra_hero_count; i++)
-			if (r == extra_heroes[i])
-				hero_kind = 1;
-		if (r == hero0)
-			hero_kind = 2;
+	DWORD* main_cam = *(DWORD**)0x00959A70;
+	DWORD* world = *(DWORD**)g_world_ptr;
+	DWORD* hero0 = world ? (DWORD*)world[0x230 / 4] : NULL;
+	int is_extra_cam = 0;
+	int hero_kind = 0;   // 1 = extra hero, 2 = hero 0
+	char nm[40];
+	int have_name = 0;
 
-		// log every distinct requested name once, to see what the game's code asks for
-		if (lookup_names_count < LOOKUP_NAMES_MAX) {
-			char nm[40];
-			strcpy(nm, "?");
-			__try {
-				char* str = ((mString*)name)->actualString;
-				if (str) {
-					strncpy(nm, str, 39);
-					nm[39] = 0;
-				}
-			}
-			__except (EXCEPTION_EXECUTE_HANDLER) {
-			}
-			int known = 0;
-			for (int i = 0; i < lookup_names_count; i++)
-				if (!strcmp(lookup_names_seen[i], nm))
-					known = 1;
-			if (!known) {
-				strcpy(lookup_names_seen[lookup_names_count++], nm);
-				twop_log("[LOOKUP] '%s' type %d from %08X -> %08X%s%s\n", nm, type, (unsigned)(DWORD)_ReturnAddress(), (unsigned)(DWORD)r,
-					is_extra_cam ? " (EXTRA CAMERA)" : "", hero_kind == 2 ? " (hero 0)" : hero_kind == 1 ? " (EXTRA HERO)" : "");
-			}
+	for (int i = 0; i < extra_cam_count; i++)
+		if (r == extra_cams[i])
+			is_extra_cam = 1;
+	for (int i = 0; i < extra_hero_count; i++)
+		if (r == extra_heroes[i])
+			hero_kind = 1;
+	if (r == hero0)
+		hero_kind = 2;
+
+	if (is_extra_cam || hero_kind == 2 || lookup_names_count < LOOKUP_NAMES_MAX) {
+		decode_mstring(name, nm, sizeof(nm));
+		have_name = 1;
+	}
+
+	// log every distinct requested name once, to see what the game's code asks for
+	if (have_name && lookup_names_count < LOOKUP_NAMES_MAX) {
+		int known = 0;
+		for (int i = 0; i < lookup_names_count; i++)
+			if (!strcmp(lookup_names_seen[i], nm))
+				known = 1;
+		if (!known) {
+			strcpy(lookup_names_seen[lookup_names_count++], nm);
+			twop_log("[LOOKUP] '%s' type %d from %08X -> %08X%s%s\n", nm, type, (unsigned)(DWORD)_ReturnAddress(), (unsigned)(DWORD)r,
+				is_extra_cam ? " (EXTRA CAMERA)" : "", hero_kind == 2 ? " (hero 0)" : hero_kind == 1 ? " (EXTRA HERO)" : "");
 		}
+	}
 
-		if (is_extra_cam && type == 0x1D && main_cam)
-			return main_cam;
+	if (is_extra_cam && type == 0x1D && main_cam)
+		return main_cam;
+
+	// code running on an extra hero's own objects that asks for "HERO" gets that hero, not player 1
+	if (hero_kind == 2 && context_mode && dual_input_enabled && have_name && !_stricmp(nm, "HERO")) {
+		DWORD* ctx = context_hero_from_stack("lookup 'HERO'", (DWORD)_ReturnAddress());
+		if (ctx)
+			return ctx;
 	}
 	return r;
 }
@@ -2176,6 +2291,10 @@ int __fastcall game_handle_game_states(void* this, void* edx, void* a2) {
 		set_dual_input(0);
 	if (GetAsyncKeyState(VK_F8) & 1)
 		bring_extra_heroes_to_p1();
+	if (GetAsyncKeyState(VK_F7) & 1) {
+		context_mode = !context_mode;
+		twop_log("[CTX] context resolution %s\n", context_mode ? "ON" : "OFF");
+	}
 
 	if (adding_second_player) {
 
@@ -2755,6 +2874,7 @@ void install_patches() {
 	install_pad_update_hook();
 	install_camera_lookup_fix();
 	install_add_player_name_hooks();
+	install_get_hero_hooks();
 
 
 	/*
