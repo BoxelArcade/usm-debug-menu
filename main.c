@@ -898,6 +898,100 @@ static void log_joy_sample(LPDIJOYSTATE2 j) {
 }
 
 /*
+ * ---- dual input: keyboard+mouse for player 1, controller for player 2 ---------------------
+ * Every pad's update() (vtable entry 0x0088EAA0 -> 0x0058E5C0) calls get_pad(), which re-polls all
+ * DirectInput devices. We hook update() and remember which pad is updating (input_pass). The
+ * DirectInput hook then hands each pass only its own devices:
+ *   pass 0 (pad 0, player 1): keyboard + mouse real, gamepad neutral
+ *   pass 1 (pad 1, player 2): gamepad real, keyboard + mouse zeroed
+ * The game's own button mapping is applied to both, so no snapshot format is guessed.
+ *
+ * Evidence from the logs: hero brains hold the owning pad's script id (0xF4240 + pad number) in
+ * 19 sub-objects (every 0x34 bytes from brain+0x1C). Extra heroes carry pad 0's id, which is why
+ * they mirror player 1. set_dual_input(1) changes those ids to pad 1's id (0xF4241).
+ * Pad 1 itself is marked disconnected (+0x88 = 1, garbage +0x70), so it is brought to life with
+ * pad 0's controller index. All of this is an experiment and is only active between F9 and F10.
+ */
+int dual_input_enabled = 0;
+volatile int input_pass = 0;
+
+typedef void(__fastcall* pad_update_ptr)(void* this, void* edx);
+pad_update_ptr pad_update_original = (void*)0x0058E5C0;
+
+void __fastcall pad_update_hook(void* this, void* edx) {
+	int pass = 0;
+	if (dual_input_enabled && this && this == (void*)pad_manager_pad(1))
+		pass = 1;
+	input_pass = pass;
+	pad_update_original(this, edx);
+	input_pass = 0;
+}
+
+void install_pad_update_hook(void) {
+	DWORD* slot = (DWORD*)0x0088EAA0;
+	DWORD old;
+	if (*slot != 0x0058E5C0) {
+		twop_log("[DUAL] pad update slot holds %08X, not 0058E5C0; hook not installed\n", (unsigned)*slot);
+		return;
+	}
+	if (VirtualProtect(slot, 4, PAGE_READWRITE, &old)) {
+		*slot = (DWORD)pad_update_hook;
+		VirtualProtect(slot, 4, old, &old);
+		twop_log("[DUAL] pad update hook installed\n");
+	}
+}
+
+static void patch_extra_hero_ids(DWORD from, DWORD to) {
+	for (int h = 0; h < extra_hero_count; h++) {
+		DWORD* brain = (DWORD*)extra_heroes[h][0x8C / 4];
+		int patched = 0;
+		if (!brain) {
+			twop_log("[DUAL] extra hero %d has no brain\n", h);
+			continue;
+		}
+		__try {
+			for (int off = 0; off < 0x424; off += 4) {
+				DWORD* slot = (DWORD*)((BYTE*)brain + off);
+				if (*slot == from) {
+					*slot = to;
+					patched++;
+				}
+			}
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) {
+			twop_log("[DUAL] extra hero %d: read fault\n", h);
+		}
+		twop_log("[DUAL] extra hero %d (brain %08X): %d ids %u -> %u\n", h, (unsigned)(DWORD)brain, patched, (unsigned)from, (unsigned)to);
+	}
+}
+
+static void set_dual_input(int on) {
+	DWORD* p0 = pad_manager_pad(0);
+	DWORD* p1 = pad_manager_pad(1);
+	if (!p0 || !p1) {
+		twop_log("[DUAL] pad objects missing\n");
+		return;
+	}
+	if (on == dual_input_enabled)
+		return;
+
+	if (on) {
+		p1[0x70 / 4] = p0[0x70 / 4];   // same controller index as pad 0
+		p1[0x88 / 4] = 0;              // "connected"
+		p1[0x8C / 4] = 0;
+		dual_input_enabled = 1;
+		patch_extra_hero_ids(0xF4240u, 0xF4241u);
+	}
+	else {
+		dual_input_enabled = 0;
+		patch_extra_hero_ids(0xF4241u, 0xF4240u);
+		p1[0x88 / 4] = 1;
+		p1[0x8C / 4] = 1;
+	}
+	twop_log("[DUAL] dual input %s (pad 1: +0x70=%d +0x88=%d)\n", on ? "ON" : "OFF", (int)p1[0x70 / 4], (int)p1[0x88 / 4]);
+}
+
+/*
  * ---- control read probe (logging only) ----------------------------------------------------
  * Every control read in the game goes through 0x00821E90 (get_control_value(array, id) -> float).
  * There are 31 call sites. We hook all of them and log, once per (call site, id), any read that
@@ -1648,6 +1742,25 @@ HRESULT __stdcall GetDeviceStateHook(IDirectInputDevice8* this, DWORD cbData, LP
 		memset(lpvData, 0, cbData);
 	}
 
+	if (dual_input_enabled && SUCCEEDED(res)) {
+		if (cbData == 256) {
+			if (input_pass == 1)
+				memset(lpvData, 0, 256);
+		}
+		else if (cbData == sizeof(DIJOYSTATE2)) {
+			if (input_pass == 0) {
+				LPDIJOYSTATE2 j = (LPDIJOYSTATE2)lpvData;
+				memset(j, 0, sizeof(*j));
+				for (int i = 0; i < 4; i++)
+					j->rgdwPOV[i] = 0xFFFFFFFF;
+			}
+		}
+		else if (cbData == sizeof(DIMOUSESTATE2) || cbData == sizeof(DIMOUSESTATE)) {
+			if (input_pass == 1)
+				memset(lpvData, 0, cbData);
+		}
+	}
+
 
 
 	//printf("Device State called %08X %d\n", this, cbData);
@@ -1782,9 +1895,9 @@ int __fastcall game_handle_game_states(void* this, void* edx, void* a2) {
 	}
 
 	if (GetAsyncKeyState(VK_F9) & 1)
-		repoint_extra_heroes_pad(1);
+		set_dual_input(1);
 	if (GetAsyncKeyState(VK_F10) & 1)
-		repoint_extra_heroes_pad(0);
+		set_dual_input(0);
 
 	if (adding_second_player) {
 
@@ -2361,6 +2474,7 @@ void install_patches() {
 
 	HookFunc(0x0055B44E, load_hero_pack_hook, 0, "Hooking add_player's call to the hero pack loader (2nd player experiment)");
 	install_control_read_probe();
+	install_pad_update_hook();
 
 
 	/*
