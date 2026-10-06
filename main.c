@@ -1502,6 +1502,134 @@ void install_hero_input_probe(void) {
 }
 
 /*
+ * ---- swing probe (logging only) -----------------------------------------------------------
+ * brain+0xC holds the locomotion mode: 1 = web zip, 3 = swinging (spiderman_is_swinging() is
+ * `brain[0xC] == 3`). Zip became independent once the extra hero was created under pad 1's owner
+ * id, swing did not, so something about swing is still shared.
+ *   - mode monitor: logs every change of that field for hero 0 and each extra hero
+ *   - state probe: the swing state methods at 0x473650 (reads sticks and hero 0's position) and
+ *     0x47DDD0 (enter-swing: sets brain[0xC] = 3 on its own entity, this[0x18]) are only reachable
+ *     through vtable slots 0x877498 / 0x8774D8, which are patched to log each distinct state object
+ *     together with the entity it is bound to.
+ */
+static int mode_of_entity(DWORD* ent) {
+	int m = -2;
+	if (!ent)
+		return -3;
+	__try {
+		DWORD* b = (DWORD*)ent[0x8C / 4];
+		m = b ? (int)b[0xC / 4] : -1;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		m = -2;
+	}
+	return m;
+}
+
+static void monitor_modes(void) {
+	static int last[17];
+	static int init = 0;
+	static int lines = 0;
+	int cur[17];
+	int n = 1 + (extra_hero_count > 16 ? 16 : extra_hero_count);
+	DWORD* world = *(DWORD**)g_world_ptr;
+	DWORD* hero0 = world ? (DWORD*)world[0x230 / 4] : NULL;
+
+	if (!extra_hero_count || lines >= 150)
+		return;
+
+	cur[0] = mode_of_entity(hero0);
+	for (int i = 1; i < n; i++)
+		cur[i] = mode_of_entity(extra_heroes[i - 1]);
+
+	if (!init) {
+		init = 1;
+		for (int i = 0; i < 17; i++)
+			last[i] = -99;
+	}
+	for (int i = 0; i < n; i++) {
+		if (cur[i] != last[i]) {
+			lines++;
+			if (i == 0)
+				twop_log("[MODE] hero 0: %d -> %d\n", last[i], cur[i]);
+			else
+				twop_log("[MODE] extra hero %d: %d -> %d\n", i - 1, last[i], cur[i]);
+			last[i] = cur[i];
+		}
+	}
+}
+
+typedef int(__fastcall* state_fn_ptr)(void* this, void* edx, int arg);
+state_fn_ptr state_473650_original = (void*)0x00473650;
+state_fn_ptr state_47DDD0_original = (void*)0x0047DDD0;
+
+static void log_state_object(const char* tag, void* this) {
+	static struct { DWORD tag_id; DWORD obj; } seen[96];
+	static int count = 0;
+	DWORD tag_id = (DWORD)tag;
+	DWORD* t = (DWORD*)this;
+
+	for (int i = 0; i < count; i++)
+		if (seen[i].tag_id == tag_id && seen[i].obj == (DWORD)this)
+			return;
+	if (count >= 96)
+		return;
+	seen[count].tag_id = tag_id;
+	seen[count].obj = (DWORD)this;
+	count++;
+
+	DWORD ent = 0;
+	__try {
+		ent = t[0x18 / 4];
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		ent = 0;
+	}
+
+	DWORD* world = *(DWORD**)g_world_ptr;
+	DWORD* hero0 = world ? (DWORD*)world[0x230 / 4] : NULL;
+	char who[40];
+	strcpy(who, "other");
+	if (ent == (DWORD)hero0)
+		strcpy(who, "HERO 0");
+	for (int i = 0; i < extra_hero_count; i++)
+		if (ent == (DWORD)extra_heroes[i])
+			sprintf(who, "EXTRA HERO %d", i);
+
+	twop_log("[ST] %s state object %08X: +0x14=%08X +0x18(entity)=%08X (%s) entity mode=%d\n",
+		tag, (unsigned)(DWORD)this, (unsigned)t[0x14 / 4], (unsigned)ent, who, mode_of_entity((DWORD*)ent));
+}
+
+int __fastcall state_473650_hook(void* this, void* edx, int arg) {
+	log_state_object("steer", this);
+	return state_473650_original(this, edx, arg);
+}
+
+int __fastcall state_47DDD0_hook(void* this, void* edx, int arg) {
+	log_state_object("enter-swing", this);
+	return state_47DDD0_original(this, edx, arg);
+}
+
+static void patch_vtable_slot(DWORD slot_addr, DWORD expected, void* hook, const char* name) {
+	DWORD* slot = (DWORD*)slot_addr;
+	DWORD old;
+	if (*slot != expected) {
+		twop_log("[ST] vtable slot %08X holds %08X, not %08X; %s probe not installed\n", (unsigned)slot_addr, (unsigned)*slot, (unsigned)expected, name);
+		return;
+	}
+	if (VirtualProtect(slot, 4, PAGE_READWRITE, &old)) {
+		*slot = (DWORD)hook;
+		VirtualProtect(slot, 4, old, &old);
+		twop_log("[ST] %s probe installed\n", name);
+	}
+}
+
+void install_swing_probes(void) {
+	patch_vtable_slot(0x00877498, 0x00473650, state_473650_hook, "steer (0x473650)");
+	patch_vtable_slot(0x008774D8, 0x0047DDD0, state_47DDD0_hook, "enter-swing (0x47DDD0)");
+}
+
+/*
  * add_player calls 0x0055A420 (at 0x0055B44E) only for player 0. It copies the costume name
  * into the game state and asks the streamer to load that character's pack. Both logged crashes
  * happen after/inside this path while a first hero is already loaded, so for the second hero we
@@ -1633,8 +1761,7 @@ static void spawn_second_hero(const char* costume) {
 	}
 	log_input_state("after spawning extra hero");
 	log_pads();
-	scan_hero_for_pads("hero0", hero0);
-	scan_hero_for_pads("extra", new_hero);
+	// (the per-offset pad-id scan was only needed to find the 19 owner ids; they are known now)
 	twop_log("[2P] SUCCESS: second hero entity %08X, controller object %08X\n",
 		(unsigned)(DWORD)new_hero, (unsigned)(DWORD)new_ctrl);
 }
@@ -2308,6 +2435,8 @@ int __fastcall game_handle_game_states(void* this, void* edx, void* a2) {
 		}
 	}
 
+	monitor_modes();
+
 	if (GetAsyncKeyState(VK_F9) & 1)
 		set_dual_input(1);
 	if (GetAsyncKeyState(VK_F10) & 1)
@@ -2898,6 +3027,7 @@ void install_patches() {
 	install_camera_lookup_fix();
 	install_add_player_name_hooks();
 	install_get_hero_hooks();
+	install_swing_probes();
 
 
 	/*
