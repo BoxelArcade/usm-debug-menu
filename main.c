@@ -1191,29 +1191,39 @@ static void bring_extra_heroes_to_p1(void) {
 int context_mode = 1;
 int context_logs = 0;
 
-static void decode_mstring(void* m, char* out, int n) {
-	strcpy(out, "?");
+static int try_read_cstr(const char* p, char* out, int n) {
+	int len = 0;
+	if (!p)
+		return 0;
 	__try {
-		char* a = ((mString*)m)->actualString;
-		char* cands[2];
-		cands[0] = a;
-		cands[1] = (char*)m + 12;     // small strings live inline after the header
-		for (int c = 0; c < 2; c++) {
-			char* p = cands[c];
-			int len = 0;
-			if (!p)
-				continue;
-			while (len < n - 1 && p[len] >= 32 && p[len] < 127)
-				len++;
-			if (len > 0 && p[len] == 0) {
-				memcpy(out, p, len);
-				out[len] = 0;
-				return;
-			}
+		while (len < n - 1 && p[len] >= 32 && p[len] < 127)
+			len++;
+		if (len > 0 && p[len] == 0) {
+			memcpy(out, p, len);
+			out[len] = 0;
+			return 1;
 		}
 	}
 	__except (EXCEPTION_EXECUTE_HANDLER) {
 	}
+	return 0;
+}
+
+// the lookup's name argument may be an mString (pointer at +8, or the text inline at +12) or a plain char*
+static void decode_mstring(void* m, char* out, int n) {
+	DWORD ptr_at_8 = 0;
+	strcpy(out, "?");
+	__try {
+		ptr_at_8 = *(DWORD*)((BYTE*)m + 8);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		ptr_at_8 = 0;
+	}
+	if (try_read_cstr((const char*)ptr_at_8, out, n))
+		return;
+	if (try_read_cstr((const char*)m + 12, out, n))
+		return;
+	try_read_cstr((const char*)m, out, n);
 }
 
 static DWORD* context_hero_from_stack(const char* why, DWORD caller) {
@@ -1567,6 +1577,15 @@ static void spawn_second_hero(const char* costume) {
 	sprintf(extra_hero_name, "HERO%d", extra_hero_count + 1);
 	sprintf(extra_cam_name, "CHASE_CAM%d", extra_hero_count + 1);
 	twop_log("[2P] naming the new hero '%s' and its camera '%s'\n", extra_hero_name, extra_cam_name);
+	// Everything add_player registers (the brain's 19 sub-objects, listeners, threads) is stamped with the
+	// script owner id [[0x9685DC]+0x58], which is pad 0's id (1000000). Create the extra hero as owner
+	// 1000001 (pad 1) so it listens on pad 1's channel from the start.
+	DWORD* vm = *(DWORD**)0x009685DC;
+	DWORD saved_owner = vm ? vm[0x58 / 4] : 0;
+	if (vm) {
+		twop_log("[2P] script owner id was %u, creating the hero as owner %u (pad 1)\n", (unsigned)saved_owner, 0xF4241u);
+		vm[0x58 / 4] = 0xF4241u;
+	}
 	naming_active = 1;
 	skip_pack_load = 1;
 	__try {
@@ -1577,6 +1596,8 @@ static void spawn_second_hero(const char* costume) {
 	}
 	skip_pack_load = 0;
 	naming_active = 0;
+	if (vm)
+		vm[0x58 / 4] = saved_owner;
 
 	mString_finalize(&name, NULL, 0);
 
@@ -1601,8 +1622,10 @@ static void spawn_second_hero(const char* costume) {
 		extra_heroes[extra_hero_count++] = new_hero;
 	if (extra_cam_count < 16)
 		extra_cams[extra_cam_count++] = new_ctrl;
-	if (dual_input_enabled)
-		patch_extra_hero_ids(0xF4240u, 0xF4241u);   // a hero spawned while dual input is on goes straight to pad 1
+	if (!dual_input_enabled)
+		set_dual_input(1);   // first extra hero: bring pad 1 to life (keyboard+mouse = P1, controller = P2)
+	else
+		patch_extra_hero_ids(0xF4240u, 0xF4241u);
 	{
 		DWORD* brain = (DWORD*)new_hero[0x8C / 4];
 		twop_log("[2P] extra hero entity vtable %08X, brain object %08X, brain player index %d\n",
