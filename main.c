@@ -2,6 +2,7 @@
 #include <windows.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include <math.h>
 #include <intrin.h>
 #include "forwards.h"
 #include "slf.h"
@@ -456,6 +457,8 @@ nglSetQuadZ_ptr nglSetQuadZ = (void*)0x0077AD70;
 typedef void (*nglSetClearFlags_ptr)(int);
 nglSetClearFlags_ptr nglSetClearFlags = (void*)0x00769DB0;
 
+void draw_p2_indicator(void);
+
 void aeps_RenderAll() {
 
 
@@ -472,6 +475,8 @@ void aeps_RenderAll() {
 	nglListAddString(*nglSysFont, 0.1f, 0.2f, 0.2f, nglColor(red, green, blue, 255), 1.f, 1.f, "Krystalgamer's Debug menu");
 
 	cur_time = (cur_time + 1) % duration;
+
+	draw_p2_indicator();
 
 
 	aeps_RenderAll_orig();
@@ -996,6 +1001,184 @@ static void set_dual_input(int on) {
 }
 
 /*
+ * ---- unique names for extra heroes and their cameras ---------------------------------------
+ * add_player builds the entity name from the literal "HERO" (0x88A9D0) and the camera name from
+ * "CHASE_CAM" (0x88A988); only for player numbers >= 1 does it append the number. We go through the
+ * player-0 path, so every extra hero would be called "HERO" and every extra camera "CHASE_CAM", the
+ * same as player 1's. The game looks things up by name in 43 places, so duplicates make P1's code
+ * find P2. The two call sites that assign those literals (0x55B6A2, 0x55B863) are hooked to hand
+ * over the names the game itself would use ("HERO1", "CHASE_CAM1", ...) while an extra hero spawns.
+ */
+typedef void(__fastcall* mstring_assign_cstr_ptr)(void* this, void* edx, const char* src);
+mstring_assign_cstr_ptr mstring_assign_cstr_original = (void*)0x0041FE30;
+char extra_hero_name[16] = "HERO1";
+char extra_cam_name[24] = "CHASE_CAM1";
+int naming_active = 0;
+
+void __fastcall add_player_name_hook(void* this, void* edx, const char* src) {
+	if (naming_active) {
+		if (src == (const char*)0x0088A9D0)
+			src = extra_hero_name;
+		else if (src == (const char*)0x0088A988)
+			src = extra_cam_name;
+	}
+	mstring_assign_cstr_original(this, edx, src);
+}
+
+void install_add_player_name_hooks(void) {
+	HookFunc(0x0055B6A2, add_player_name_hook, 0, "Hooking add_player's hero name assignment");
+	HookFunc(0x0055B863, add_player_name_hook, 0, "Hooking add_player's camera name assignment");
+}
+
+/*
+ * ---- P2 indicator and "bring P2 to me" ----------------------------------------------------
+ * Objects keep a 4x4 matrix pointer at +0x14: rows x, y, z axes and the translation at +0x30
+ * (floats 12..14). When bit 28 of the dword at +8 is set the game refreshes it first (0x4DB590).
+ * The indicator uses the main camera's matrix if it passes a sanity check, and works out which
+ * way is "forward" from where player 1 is relative to the camera.
+ */
+typedef void(__fastcall* entity_update_po_ptr)(void* this, void* edx, int one);
+
+static float* entity_po(DWORD* ent) {
+	if (!ent)
+		return NULL;
+	if ((ent[2] >> 0x1C) & 1)
+		((entity_update_po_ptr)0x004DB590)(ent, NULL, 1);
+	return (float*)ent[0x14 / 4];
+}
+
+static int po_looks_valid(float* po) {
+	if (!po)
+		return 0;
+	for (int r = 0; r < 3; r++) {
+		float l = po[r * 4] * po[r * 4] + po[r * 4 + 1] * po[r * 4 + 1] + po[r * 4 + 2] * po[r * 4 + 2];
+		if (!(l > 0.8f && l < 1.2f))   // also rejects NaN
+			return 0;
+	}
+	return 1;
+}
+
+void draw_p2_indicator(void) {
+	static int frame = 0;
+	static int logs = 0;
+
+	if (!dual_input_enabled || !extra_hero_count)
+		return;
+	frame++;
+
+	DWORD* world = *(DWORD**)g_world_ptr;
+	if (!world)
+		return;
+	DWORD* hero0 = (DWORD*)world[0x230 / 4];
+	DWORD* hero2 = extra_heroes[0];
+	if (!hero0 || !hero2)
+		return;
+
+	__try {
+		float* p1 = entity_po(hero0);
+		float* p2 = entity_po(hero2);
+		if (!p1 || !p2)
+			return;
+
+		float dx = p2[12] - p1[12], dy = p2[13] - p1[13], dz = p2[14] - p1[14];
+		float dist = sqrtf(dx * dx + dy * dy + dz * dz);
+
+		float sx = 320.f, sy = 60.f;
+		int have_dir = 0;
+		float right = 0, up = 0, fwd = 0;
+		int cam_ok = 0;
+		float fwd_sign = 1.f;
+
+		DWORD* main_cam = *(DWORD**)0x00959A70;
+		float* cam = main_cam ? (float*)main_cam[0x14 / 4] : NULL;
+		if (cam && po_looks_valid(cam)) {
+			cam_ok = 1;
+			// forward = whichever sign of the z axis points from the camera to player 1
+			float tx = p1[12] - cam[12], ty = p1[13] - cam[13], tz = p1[14] - cam[14];
+			if (tx * cam[8] + ty * cam[9] + tz * cam[10] < 0.f)
+				fwd_sign = -1.f;
+
+			right = dx * cam[0] + dy * cam[1] + dz * cam[2];
+			up = dx * cam[4] + dy * cam[5] + dz * cam[6];
+			fwd = fwd_sign * (dx * cam[8] + dy * cam[9] + dz * cam[10]);
+			have_dir = 1;
+
+			if (fwd > 1.f) {
+				// in front of the camera: rough perspective projection (field of view is a guess)
+				sx = 320.f + 320.f * (right / fwd) / 0.9f;
+				sy = 240.f - 240.f * (up / fwd) / 0.7f;
+			}
+			else {
+				// beside or behind: put the marker on the screen edge in that direction
+				float len = sqrtf(right * right + up * up) + 0.001f;
+				sx = 320.f + (right / len) * 1000.f;
+				sy = 240.f - (up / len) * 1000.f;
+				if (len < 0.5f)
+					sy = 1000.f;
+			}
+		}
+
+		if (sx < 50.f) sx = 50.f;
+		if (sx > 540.f) sx = 540.f;
+		if (sy < 60.f) sy = 60.f;
+		if (sy > 410.f) sy = 410.f;
+
+		char label[64];
+		const char* arrow = "";
+		if (have_dir) {
+			if (sx <= 60.f) arrow = "<";
+			else if (sx >= 530.f) arrow = ">";
+			else if (sy <= 70.f) arrow = "^";
+			else if (sy >= 400.f) arrow = "v";
+		}
+		if (sx >= 530.f)
+			sprintf(label, "P2 %dm %s", (int)dist, arrow);
+		else
+			sprintf(label, "%s P2 %dm", arrow, (int)dist);
+
+		nglListAddString(*nglSysFont, sx, sy, 0.2f, nglColor(255, 220, 0, 255), 1.f, 1.f, "%s", label);
+
+		if (logs < 6 && frame % 180 == 0) {
+			logs++;
+			twop_log("[IND] dist %.1f d=(%.1f %.1f %.1f) camera_ok=%d fwd_sign=%.0f right=%.1f up=%.1f fwd=%.1f -> screen (%.0f, %.0f)\n",
+				dist, dx, dy, dz, cam_ok, fwd_sign, right, up, fwd, sx, sy);
+		}
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		static int faulted = 0;
+		if (!faulted) {
+			faulted = 1;
+			twop_log("[IND] indicator faulted, disabled for this frame\n");
+		}
+	}
+}
+
+// F8: put every extra hero next to player 1
+static void bring_extra_heroes_to_p1(void) {
+	DWORD* world = *(DWORD**)g_world_ptr;
+	DWORD* hero0 = world ? (DWORD*)world[0x230 / 4] : NULL;
+	if (!hero0 || !extra_hero_count) {
+		twop_log("[TP] nothing to do\n");
+		return;
+	}
+	__try {
+		float* po = entity_po(hero0);
+		float m[16];
+		if (!po)
+			return;
+		for (int i = 0; i < extra_hero_count; i++) {
+			memcpy(m, po, sizeof(m));
+			m[12] += 1.5f * (i + 1);   // small sideways offset so heroes don't overlap
+			((void(*)(DWORD, float*, int))0x004F3890)((DWORD)extra_heroes[i], m, 1);
+			twop_log("[TP] extra hero %d moved next to player 1\n", i);
+		}
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		twop_log("[TP] fault while teleporting\n");
+	}
+}
+
+/*
  * ---- camera fix: extra heroes must not steal the view -------------------------------------
  * add_player gives every hero a chase camera object named "CHASE_CAM". The camera manager
  * (0x54F8C0 mode switch, 0x552F50 per-frame update) finds its cameras BY NAME with
@@ -1006,25 +1189,54 @@ static void set_dual_input(int on) {
  */
 typedef DWORD*(__cdecl* find_entity_by_name_ptr)(void* name, int type, int flag);
 find_entity_by_name_ptr find_entity_by_name_original = (void*)0x004DC300;
-int camera_lookup_logs = 0;
+#define LOOKUP_NAMES_MAX 48
+char lookup_names_seen[LOOKUP_NAMES_MAX][40];
+int lookup_names_count = 0;
 
 DWORD* __cdecl find_entity_by_name_hook(void* name, int type, int flag) {
 	DWORD* r = find_entity_by_name_original(name, type, flag);
 
-	if (type == 0x1D && r) {
+	if (extra_cam_count && r) {
 		DWORD* main_cam = *(DWORD**)0x00959A70;
-		int is_extra = 0;
+		DWORD* world = *(DWORD**)g_world_ptr;
+		DWORD* hero0 = world ? (DWORD*)world[0x230 / 4] : NULL;
+		int is_extra_cam = 0;
+		int hero_kind = 0;   // 1 = extra hero, 2 = hero 0
+
 		for (int i = 0; i < extra_cam_count; i++)
 			if (r == extra_cams[i])
-				is_extra = 1;
+				is_extra_cam = 1;
+		for (int i = 0; i < extra_hero_count; i++)
+			if (r == extra_heroes[i])
+				hero_kind = 1;
+		if (r == hero0)
+			hero_kind = 2;
 
-		if (camera_lookup_logs < 16 && (is_extra || extra_cam_count)) {
-			camera_lookup_logs++;
-			twop_log("[CAM] camera lookup from %08X returned %08X (main camera %08X)%s\n",
-				(unsigned)(DWORD)_ReturnAddress(), (unsigned)(DWORD)r, (unsigned)(DWORD)main_cam,
-				is_extra ? "  -> extra hero camera, substituting main" : "");
+		// log every distinct requested name once, to see what the game's code asks for
+		if (lookup_names_count < LOOKUP_NAMES_MAX) {
+			char nm[40];
+			strcpy(nm, "?");
+			__try {
+				char* str = ((mString*)name)->actualString;
+				if (str) {
+					strncpy(nm, str, 39);
+					nm[39] = 0;
+				}
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+			}
+			int known = 0;
+			for (int i = 0; i < lookup_names_count; i++)
+				if (!strcmp(lookup_names_seen[i], nm))
+					known = 1;
+			if (!known) {
+				strcpy(lookup_names_seen[lookup_names_count++], nm);
+				twop_log("[LOOKUP] '%s' type %d from %08X -> %08X%s%s\n", nm, type, (unsigned)(DWORD)_ReturnAddress(), (unsigned)(DWORD)r,
+					is_extra_cam ? " (EXTRA CAMERA)" : "", hero_kind == 2 ? " (hero 0)" : hero_kind == 1 ? " (EXTRA HERO)" : "");
+			}
 		}
-		if (is_extra && main_cam)
+
+		if (is_extra_cam && type == 0x1D && main_cam)
 			return main_cam;
 	}
 	return r;
@@ -1237,6 +1449,10 @@ static void spawn_second_hero(const char* costume) {
 	mString_constructor(&name, NULL, (char*)costume);
 
 	int ok = 1;
+	sprintf(extra_hero_name, "HERO%d", extra_hero_count + 1);
+	sprintf(extra_cam_name, "CHASE_CAM%d", extra_hero_count + 1);
+	twop_log("[2P] naming the new hero '%s' and its camera '%s'\n", extra_hero_name, extra_cam_name);
+	naming_active = 1;
 	skip_pack_load = 1;
 	__try {
 		world_dynamics_system_add_player(shadow, NULL, &name);
@@ -1245,6 +1461,7 @@ static void spawn_second_hero(const char* costume) {
 		ok = 0;
 	}
 	skip_pack_load = 0;
+	naming_active = 0;
 
 	mString_finalize(&name, NULL, 0);
 
@@ -1269,6 +1486,8 @@ static void spawn_second_hero(const char* costume) {
 		extra_heroes[extra_hero_count++] = new_hero;
 	if (extra_cam_count < 16)
 		extra_cams[extra_cam_count++] = new_ctrl;
+	if (dual_input_enabled)
+		patch_extra_hero_ids(0xF4240u, 0xF4241u);   // a hero spawned while dual input is on goes straight to pad 1
 	{
 		DWORD* brain = (DWORD*)new_hero[0x8C / 4];
 		twop_log("[2P] extra hero entity vtable %08X, brain object %08X, brain player index %d\n",
@@ -1955,6 +2174,8 @@ int __fastcall game_handle_game_states(void* this, void* edx, void* a2) {
 		set_dual_input(1);
 	if (GetAsyncKeyState(VK_F10) & 1)
 		set_dual_input(0);
+	if (GetAsyncKeyState(VK_F8) & 1)
+		bring_extra_heroes_to_p1();
 
 	if (adding_second_player) {
 
@@ -2533,6 +2754,7 @@ void install_patches() {
 	install_control_read_probe();
 	install_pad_update_hook();
 	install_camera_lookup_fix();
+	install_add_player_name_hooks();
 
 
 	/*
