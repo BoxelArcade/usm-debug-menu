@@ -740,6 +740,76 @@ static int second_hero_filter(EXCEPTION_POINTERS* ep) {
 }
 
 /*
+ * ---- input probe (logging only, changes no behaviour) -------------------------------------
+ * What the exe shows:
+ *   - 0x987948 is the input manager. It holds 10 raw gamepad states (stride 0x110) and an
+ *     array of controller object pointers at mgr+0x129D8 (element count at mgr+0x129D0).
+ *   - The game only ever fills slot 0 (every call to set_controller 0x8203F0 passes index 0).
+ *   - The hero input function (0x00473650, vtable slot at 0x00877498) reads its movement
+ *     controls (ids 0x10, 0x12, 0x13) from controllers[0]+0x18 via the getter 0x821E90.
+ * The probe logs the controller table, and every distinct `this` that reaches the hero input
+ * function, so we can see how to tell hero 2's call apart from hero 1's.
+ */
+typedef int(__fastcall* get_gamepad_count_ptr)(void* this);
+get_gamepad_count_ptr get_gamepad_count = (void*)0x00820080;
+
+static void log_input_state(const char* when) {
+	DWORD mgr = *(DWORD*)0x00987948;
+	twop_log("[IN] ---- input state (%s) ----\n", when);
+	if (!mgr) {
+		twop_log("[IN] no input manager\n");
+		return;
+	}
+	twop_log("[IN] manager %08X, controller slot count %u, gamepads detected %d\n",
+		(unsigned)mgr, (unsigned)*(DWORD*)(mgr + 0x129D0), get_gamepad_count((void*)mgr));
+	for (int i = 0; i < 4; i++)
+		twop_log("[IN]   controllers[%d] = %08X\n", i, (unsigned)*(DWORD*)(mgr + 0x129D8 + i * 4));
+	twop_log("[IN] controller globals: 965C0C=%08X 965C10=%08X 965C14=%08X 965C1C=%08X\n",
+		(unsigned)*(DWORD*)0x00965C0C, (unsigned)*(DWORD*)0x00965C10,
+		(unsigned)*(DWORD*)0x00965C14, (unsigned)*(DWORD*)0x00965C1C);
+	DWORD c0 = *(DWORD*)(mgr + 0x129D8);
+	if (c0)
+		twop_log("[IN] controllers[0]: vtable %08X, control count (+0x18) %u\n", (unsigned)*(DWORD*)c0, (unsigned)*(DWORD*)(c0 + 0x18));
+}
+
+typedef void(__fastcall* hero_input_fn_ptr)(void* this, void* edx, int arg);
+hero_input_fn_ptr hero_input_fn_original = (void*)0x00473650;
+
+DWORD probe_seen[16];
+int probe_seen_count = 0;
+
+void __fastcall hero_input_fn_hook(void* this, void* edx, int arg) {
+	int known = 0;
+	for (int i = 0; i < probe_seen_count; i++)
+		if (probe_seen[i] == (DWORD)this) known = 1;
+
+	if (!known && probe_seen_count < 16) {
+		DWORD* t = (DWORD*)this;
+		DWORD* world = *(DWORD**)g_world_ptr;
+		probe_seen[probe_seen_count++] = (DWORD)this;
+		twop_log("[IN] hero input fn: new this=%08X vtbl=%08X [+0x14]=%08X [+0x50]=%08X [+0x8C]=%08X  (hero0 entity=%08X, last extra hero=%08X)\n",
+			(unsigned)(DWORD)this, (unsigned)t[0], (unsigned)t[0x14 / 4], (unsigned)t[0x50 / 4], (unsigned)t[0x8C / 4],
+			(unsigned)(world ? world[0x230 / 4] : 0), (unsigned)(DWORD)second_hero_entity);
+	}
+	hero_input_fn_original(this, edx, arg);
+}
+
+// the function is only reached through a vtable slot, so patch the slot itself
+void install_hero_input_probe(void) {
+	DWORD* slot = (DWORD*)0x00877498;
+	DWORD old;
+	if (*slot != 0x00473650) {
+		puts("[IN] vtable slot 0x877498 does not hold 0x473650, probe not installed");
+		return;
+	}
+	if (VirtualProtect(slot, 4, PAGE_READWRITE, &old)) {
+		*slot = (DWORD)hero_input_fn_hook;
+		VirtualProtect(slot, 4, old, &old);
+		puts("[IN] hero input probe installed");
+	}
+}
+
+/*
  * add_player calls 0x0055A420 (at 0x0055B44E) only for player 0. It copies the costume name
  * into the game state and asks the streamer to load that character's pack. Both logged crashes
  * happen after/inside this path while a first hero is already loaded, so for the second hero we
@@ -840,6 +910,7 @@ static void spawn_second_hero(const char* costume) {
 
 	second_hero_entity = new_hero;
 	second_hero_ctrl = new_ctrl;
+	log_input_state("after spawning extra hero");
 	twop_log("[2P] SUCCESS: second hero entity %08X, controller object %08X\n",
 		(unsigned)(DWORD)new_hero, (unsigned)(DWORD)new_ctrl);
 }
@@ -2066,6 +2137,7 @@ void install_patches() {
 	HookFunc(0x00421128, sub_41F9D0_hook, 0, "Hooking sub_41F9D0");
 
 	HookFunc(0x0055B44E, load_hero_pack_hook, 0, "Hooking add_player's call to the hero pack loader (2nd player experiment)");
+	install_hero_input_probe();
 
 
 	/*
