@@ -744,6 +744,10 @@ static int second_hero_filter(EXCEPTION_POINTERS* ep) {
 DWORD* extra_heroes[16];
 int extra_hero_count = 0;
 
+// each extra hero also got its own chase camera object (the 2nd object add_player builds)
+DWORD* extra_cams[16];
+int extra_cam_count = 0;
+
 // Experiment (F9 / F10): each hero has a "brain" object at entity+0x8C whose +0x14 field holds the
 // player index passed to 0x4C0CD0 by add_player. Set it for all extra heroes and log what happens.
 static void set_extra_heroes_player_index(int idx) {
@@ -992,6 +996,57 @@ static void set_dual_input(int on) {
 }
 
 /*
+ * ---- camera fix: extra heroes must not steal the view -------------------------------------
+ * add_player gives every hero a chase camera object named "CHASE_CAM". The camera manager
+ * (0x54F8C0 mode switch, 0x552F50 per-frame update) finds its cameras BY NAME with
+ * 0x004DC300(name, 0x1D, 0). Extra heroes created through the count == 0 path also get the plain
+ * name, so a lookup can return an extra hero's camera and the view jumps to that hero (seen when
+ * player 2 web zips). We hook every call site of the lookup and, when it returns one of the extra
+ * heroes' cameras, return the main camera ([0x959A70], player 1's) instead.
+ */
+typedef DWORD*(__cdecl* find_entity_by_name_ptr)(void* name, int type, int flag);
+find_entity_by_name_ptr find_entity_by_name_original = (void*)0x004DC300;
+int camera_lookup_logs = 0;
+
+DWORD* __cdecl find_entity_by_name_hook(void* name, int type, int flag) {
+	DWORD* r = find_entity_by_name_original(name, type, flag);
+
+	if (type == 0x1D && r) {
+		DWORD* main_cam = *(DWORD**)0x00959A70;
+		int is_extra = 0;
+		for (int i = 0; i < extra_cam_count; i++)
+			if (r == extra_cams[i])
+				is_extra = 1;
+
+		if (camera_lookup_logs < 16 && (is_extra || extra_cam_count)) {
+			camera_lookup_logs++;
+			twop_log("[CAM] camera lookup from %08X returned %08X (main camera %08X)%s\n",
+				(unsigned)(DWORD)_ReturnAddress(), (unsigned)(DWORD)r, (unsigned)(DWORD)main_cam,
+				is_extra ? "  -> extra hero camera, substituting main" : "");
+		}
+		if (is_extra && main_cam)
+			return main_cam;
+	}
+	return r;
+}
+
+static const DWORD find_entity_sites[] = {
+	0x004B64FC, 0x004DCE59, 0x004DCE7A, 0x004DCEAA, 0x004DD55C, 0x0050B9D9, 0x00528BE3, 0x0054AE19,
+	0x0054F800, 0x0054F95D, 0x0054FA08, 0x0054FA29, 0x0054FB8D, 0x0054FBAE, 0x005531EC, 0x0055320C,
+	0x005533EE, 0x0055D23E, 0x0057840C, 0x005A37F2, 0x005B85A9, 0x005BB1D1, 0x005DD9D5, 0x0065EFBE,
+	0x0065F035, 0x0065F455, 0x00660455, 0x00660945, 0x00660A65, 0x00668BC0, 0x00668C1D, 0x006A5C90,
+	0x006AA7FB, 0x006AA897, 0x006DF8EB, 0x00707FDE, 0x00708022, 0x0071BE71, 0x0071BEC8, 0x0071BFF0,
+	0x0072AA3B, 0x0072ADF9, 0x0072F74D
+};
+
+void install_camera_lookup_fix(void) {
+	int n = (int)(sizeof(find_entity_sites) / sizeof(find_entity_sites[0]));
+	for (int i = 0; i < n; i++)
+		HookFunc(find_entity_sites[i], find_entity_by_name_hook, 0, "Hooking a find-entity-by-name call site (camera fix)");
+	twop_log("[CAM] camera lookup fix installed on %d call sites\n", n);
+}
+
+/*
  * ---- control read probe (logging only) ----------------------------------------------------
  * Every control read in the game goes through 0x00821E90 (get_control_value(array, id) -> float).
  * There are 31 call sites. We hook all of them and log, once per (call site, id), any read that
@@ -1212,6 +1267,8 @@ static void spawn_second_hero(const char* costume) {
 	second_hero_ctrl = new_ctrl;
 	if (extra_hero_count < 16)
 		extra_heroes[extra_hero_count++] = new_hero;
+	if (extra_cam_count < 16)
+		extra_cams[extra_cam_count++] = new_ctrl;
 	{
 		DWORD* brain = (DWORD*)new_hero[0x8C / 4];
 		twop_log("[2P] extra hero entity vtable %08X, brain object %08X, brain player index %d\n",
@@ -2475,6 +2532,7 @@ void install_patches() {
 	HookFunc(0x0055B44E, load_hero_pack_hook, 0, "Hooking add_player's call to the hero pack loader (2nd player experiment)");
 	install_control_read_probe();
 	install_pad_update_hook();
+	install_camera_lookup_fix();
 
 
 	/*
