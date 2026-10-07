@@ -1020,12 +1020,6 @@ void __fastcall pad_update_hook(void* this, void* edx) {
 		pass = 1;
 	input_pass = pass;
 	pad_update_original(this, edx);
-	if (dual_input_enabled) {
-		if (this == (void*)pad_manager_pad(0))
-			capture_controller_snapshot(0);
-		else if (this == (void*)pad_manager_pad(1))
-			capture_controller_snapshot(1);
-	}
 	input_pass = 0;
 }
 
@@ -1614,6 +1608,8 @@ void install_hero_input_probe(void) {
  *     through vtable slots 0x877498 / 0x8774D8, which are patched to log each distinct state object
  *     together with the entity it is bound to.
  */
+unsigned tick_count = 0;
+
 static int mode_of_entity(DWORD* ent) {
 	int m = -2;
 	if (!ent)
@@ -1637,6 +1633,7 @@ static void monitor_modes(void) {
 	DWORD* world = *(DWORD**)g_world_ptr;
 	DWORD* hero0 = world ? (DWORD*)world[0x230 / 4] : NULL;
 
+	tick_count++;
 	if (!extra_hero_count || lines >= 150)
 		return;
 
@@ -1653,9 +1650,9 @@ static void monitor_modes(void) {
 		if (cur[i] != last[i]) {
 			lines++;
 			if (i == 0)
-				twop_log("[MODE] hero 0: %d -> %d\n", last[i], cur[i]);
+				twop_log("[MODE] f=%u hero 0: %d -> %d\n", tick_count, last[i], cur[i]);
 			else
-				twop_log("[MODE] extra hero %d: %d -> %d\n", i - 1, last[i], cur[i]);
+				twop_log("[MODE] f=%u extra hero %d: %d -> %d\n", tick_count, i - 1, last[i], cur[i]);
 			last[i] = cur[i];
 		}
 	}
@@ -1705,35 +1702,20 @@ static void log_state_object(const char* tag, void* this) {
 int __fastcall state_473650_hook(void* this, void* edx, int arg) {
 	DWORD* ent = NULL;
 	DWORD* prev_ctx = state_ctx_entity;
-	int swapped = 0;
 	int r;
 
-	log_state_object("steer", this);
+	log_state_object("ground-update", this);
 	__try {
 		ent = (DWORD*)((DWORD*)this)[0x18 / 4];
 	}
 	__except (EXCEPTION_EXECUTE_HANDLER) {
 		ent = NULL;
 	}
-
-	if (context_mode && dual_input_enabled && extra_hero_count && ent) {
+	if (context_mode && dual_input_enabled && extra_hero_count && ent)
 		state_ctx_entity = ent;
-		swapped = swap_in_controller_values(ent);
-		if (swapped && ctrl_swap_logs < 8) {
-			int diff = 0;
-			for (int i = 0; i < ctrl_snap_len[0] && i < ctrl_snap_len[1]; i++)
-				if (ctrl_snap[0][i] != ctrl_snap[1][i])
-					diff++;
-			ctrl_swap_logs++;
-			twop_log("[CTRLSW] steer for %s uses the player %d controller values (P1/P2 snapshots differ in %d bytes)\n",
-				is_extra_hero(ent) ? "an EXTRA hero" : "hero 0", is_extra_hero(ent) ? 2 : 1, diff);
-		}
-	}
 
 	r = state_473650_original(this, edx, arg);
 
-	if (swapped)
-		swap_out_controller_values();
 	state_ctx_entity = prev_ctx;
 	return r;
 }
@@ -1759,6 +1741,122 @@ int __fastcall state_47DDD0_hook(void* this, void* edx, int arg) {
 	return r;
 }
 
+/*
+ * State enter methods (vtable slots, 5 stack args, ret 0x14). Locomotion states come in pairs: enter
+ * (ret 0x14) and update (ret 4) in adjacent vtable entries. Mode 1 ground: enter 0x4584E0 / update
+ * 0x473650. Mode 3 swing: enter 0x47DA60 / update 0x47DDD0. Mode 6/7 jump: enter 0x469880 / update
+ * 0x473E70. Mode 9: enter 0x45D340 / update 0x47DEF0. Each enter is logged with the objects it is
+ * bound to, both heroes' modes, and the chain of return addresses that led to it, to find out why one
+ * hero's swing start puts the other hero into the jump state.
+ */
+static int collect_return_addrs(DWORD* out, int max) {
+	DWORD* sp = (DWORD*)_AddressOfReturnAddress();
+	NT_TIB* tib = (NT_TIB*)NtCurrentTeb();
+	DWORD* top = (DWORD*)tib->StackBase;
+	int n = 0;
+	__try {
+		for (int i = 0; sp + i < top && i < 320 && n < max; i++) {
+			DWORD v = sp[i];
+			if (v >= 0x00401000 && v < 0x0086F000) {
+				BYTE* b = (BYTE*)v;
+				if (b[-5] == 0xE8 || (b[-2] == 0xFF && (b[-1] & 0x38) == 0x10) ||
+					(b[-3] == 0xFF && (b[-2] & 0x38) == 0x10) || (b[-6] == 0xFF && (b[-5] & 0x38) == 0x10))
+					out[n++] = v;
+			}
+		}
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+	}
+	return n;
+}
+
+static void describe_owner(DWORD v, char* out) {
+	DWORD* world = *(DWORD**)g_world_ptr;
+	DWORD* hero0 = world ? (DWORD*)world[0x230 / 4] : NULL;
+	strcpy(out, "other");
+	if (!v) {
+		strcpy(out, "null");
+		return;
+	}
+	if (hero0) {
+		DWORD b = hero0[0x8C / 4];
+		if (v == (DWORD)hero0) {
+			strcpy(out, "HERO 0");
+			return;
+		}
+		if (b && v >= b && v < b + 0x424) {
+			sprintf(out, "inside HERO 0 brain +0x%X", (unsigned)(v - b));
+			return;
+		}
+	}
+	for (int i = 0; i < extra_hero_count; i++) {
+		DWORD b = extra_heroes[i][0x8C / 4];
+		if (v == (DWORD)extra_heroes[i]) {
+			sprintf(out, "EXTRA HERO %d", i);
+			return;
+		}
+		if (b && v >= b && v < b + 0x424) {
+			sprintf(out, "inside EXTRA %d brain +0x%X", i, (unsigned)(v - b));
+			return;
+		}
+	}
+}
+
+static int enter_logs = 0;
+
+static void log_state_enter(const char* tag, void* this) {
+	DWORD* t = (DWORD*)this;
+	DWORD ai = 0, ent = 0, ra[7];
+	char w14[48], w18[48], line[320];
+	DWORD* world = *(DWORD**)g_world_ptr;
+	DWORD* hero0 = world ? (DWORD*)world[0x230 / 4] : NULL;
+	int n, len;
+
+	if (enter_logs >= 300)
+		return;
+	enter_logs++;
+
+	__try {
+		ai = t[0x14 / 4];
+		ent = t[0x18 / 4];
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+	}
+	describe_owner(ai, w14);
+	describe_owner(ent, w18);
+	n = collect_return_addrs(ra, 6);
+
+	len = sprintf(line, "[ENTER] f=%u %s: state %08X +0x14=%08X (%s) +0x18=%08X (%s) | modes hero0=%d extra0=%d | from",
+		tick_count, tag, (unsigned)(DWORD)this, (unsigned)ai, w14, (unsigned)ent, w18,
+		mode_of_entity(hero0), extra_hero_count ? mode_of_entity(extra_heroes[0]) : -9);
+	for (int i = 0; i < n && len < 280; i++)
+		len += sprintf(line + len, " %08X", (unsigned)ra[i]);
+	twop_log("%s\n", line);
+}
+
+typedef int(__fastcall* state_enter_ptr)(void* this, void* edx, int a1, int a2, int a3, int a4, int a5);
+state_enter_ptr enter_jump_original = (void*)0x00469880;
+state_enter_ptr enter_swing_original = (void*)0x0047DA60;
+state_enter_ptr enter_nine_original = (void*)0x0045D340;
+state_enter_ptr enter_ground_original = (void*)0x004584E0;
+
+int __fastcall enter_jump_hook(void* this, void* edx, int a1, int a2, int a3, int a4, int a5) {
+	log_state_enter("ENTER-JUMP(6/7)", this);
+	return enter_jump_original(this, edx, a1, a2, a3, a4, a5);
+}
+int __fastcall enter_swing_hook(void* this, void* edx, int a1, int a2, int a3, int a4, int a5) {
+	log_state_enter("ENTER-SWING(3)", this);
+	return enter_swing_original(this, edx, a1, a2, a3, a4, a5);
+}
+int __fastcall enter_nine_hook(void* this, void* edx, int a1, int a2, int a3, int a4, int a5) {
+	log_state_enter("ENTER(9)", this);
+	return enter_nine_original(this, edx, a1, a2, a3, a4, a5);
+}
+int __fastcall enter_ground_hook(void* this, void* edx, int a1, int a2, int a3, int a4, int a5) {
+	log_state_enter("ENTER-GROUND(1)", this);
+	return enter_ground_original(this, edx, a1, a2, a3, a4, a5);
+}
+
 static void patch_vtable_slot(DWORD slot_addr, DWORD expected, void* hook, const char* name) {
 	DWORD* slot = (DWORD*)slot_addr;
 	DWORD old;
@@ -1775,7 +1873,11 @@ static void patch_vtable_slot(DWORD slot_addr, DWORD expected, void* hook, const
 
 void install_swing_probes(void) {
 	patch_vtable_slot(0x00877498, 0x00473650, state_473650_hook, "steer (0x473650)");
-	patch_vtable_slot(0x008774D8, 0x0047DDD0, state_47DDD0_hook, "enter-swing (0x47DDD0)");
+	patch_vtable_slot(0x008774D8, 0x0047DDD0, state_47DDD0_hook, "swing update (0x47DDD0)");
+	patch_vtable_slot(0x00877170, 0x00469880, enter_jump_hook, "enter-jump (0x469880)");
+	patch_vtable_slot(0x008774D0, 0x0047DA60, enter_swing_hook, "enter-swing (0x47DA60)");
+	patch_vtable_slot(0x008775C8, 0x0045D340, enter_nine_hook, "enter mode 9 (0x45D340)");
+	patch_vtable_slot(0x00877490, 0x004584E0, enter_ground_hook, "enter-ground (0x4584E0)");
 }
 
 /*
@@ -3392,8 +3494,7 @@ void setup_debug_menu() {
 		"peter_hooded",
 		"peter_hooded_costume",
 		"venom",
-		"venom_spider",
-		"wolverine"
+		"venom_spider"
 	};
 
 
