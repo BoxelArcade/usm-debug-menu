@@ -3392,7 +3392,7 @@ void setup_debug_menu() {
 		"peter_hooded",
 		"peter_hooded_costume",
 		"venom",
-		"venom_spider"
+		"venom_spider",
 		"wolverine"
 	};
 
