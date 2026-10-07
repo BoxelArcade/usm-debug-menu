@@ -924,6 +924,93 @@ static void log_joy_sample(LPDIJOYSTATE2 j) {
 int dual_input_enabled = 0;
 volatile int input_pass = 0;
 
+/*
+ * Per-hero controller values. The swing steering state (0x473650) reads the stick straight from the
+ * shared in-game controller object (mgr+0x129D8 -> +0x18 = value array: count, then 72-byte entries),
+ * not through a hero's pad. We poll twice per frame (pad 0 then pad 1), so that shared object holds
+ * the LAST poll: player 2's. After each pad update we keep a copy of the array; while a hero's steer
+ * state runs we load that hero's copy into the shared object and restore it afterwards.
+ */
+#define CTRL_SNAP_MAX 4096
+static BYTE ctrl_snap[2][CTRL_SNAP_MAX];
+static int ctrl_snap_len[2];
+static BYTE ctrl_saved[CTRL_SNAP_MAX];
+static int ctrl_saved_len = 0;
+int ctrl_swap_logs = 0;
+
+// set by our state-method wrappers: the entity whose state code is currently running
+DWORD* state_ctx_entity = NULL;
+
+static int is_extra_hero(DWORD* e) {
+	if (!e)
+		return 0;
+	for (int i = 0; i < extra_hero_count; i++)
+		if (extra_heroes[i] == e)
+			return 1;
+	return 0;
+}
+
+static BYTE* ingame_controller_array(int* len) {
+	DWORD mgr = *(DWORD*)0x00987948;
+	DWORD ctrl, count;
+	if (!mgr)
+		return NULL;
+	ctrl = *(DWORD*)(mgr + 0x129D8);
+	if (!ctrl)
+		return NULL;
+	count = *(DWORD*)(ctrl + 0x18);
+	if (count == 0 || count > 64)
+		return NULL;
+	*len = (int)(4 + count * 72);
+	if (*len > CTRL_SNAP_MAX)
+		return NULL;
+	return (BYTE*)(ctrl + 0x18);
+}
+
+static void capture_controller_snapshot(int which) {
+	int len = 0;
+	__try {
+		BYTE* arr = ingame_controller_array(&len);
+		if (!arr)
+			return;
+		memcpy(ctrl_snap[which], arr, len);
+		ctrl_snap_len[which] = len;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+	}
+}
+
+// returns 1 when the shared controller now holds the snapshot of the player that owns `ent`
+static int swap_in_controller_values(DWORD* ent) {
+	int which = is_extra_hero(ent) ? 1 : 0;
+	int len = 0;
+	if (!ctrl_snap_len[0] || !ctrl_snap_len[1])
+		return 0;
+	__try {
+		BYTE* arr = ingame_controller_array(&len);
+		if (!arr || len != ctrl_snap_len[which])
+			return 0;
+		memcpy(ctrl_saved, arr, len);
+		ctrl_saved_len = len;
+		memcpy(arr, ctrl_snap[which], len);
+		return 1;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		return 0;
+	}
+}
+
+static void swap_out_controller_values(void) {
+	int len = 0;
+	__try {
+		BYTE* arr = ingame_controller_array(&len);
+		if (arr && len == ctrl_saved_len)
+			memcpy(arr, ctrl_saved, len);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+	}
+}
+
 typedef void(__fastcall* pad_update_ptr)(void* this, void* edx);
 pad_update_ptr pad_update_original = (void*)0x0058E5C0;
 
@@ -933,6 +1020,12 @@ void __fastcall pad_update_hook(void* this, void* edx) {
 		pass = 1;
 	input_pass = pass;
 	pad_update_original(this, edx);
+	if (dual_input_enabled) {
+		if (this == (void*)pad_manager_pad(0))
+			capture_controller_snapshot(0);
+		else if (this == (void*)pad_manager_pad(1))
+			capture_controller_snapshot(1);
+	}
 	input_pass = 0;
 }
 
@@ -1267,13 +1360,18 @@ get_hero_ptr get_hero_original = (void*)0x00514A50;
 DWORD* __fastcall get_hero_hook(void* this, void* edx, int idx) {
 	DWORD* r = get_hero_original(this, edx, idx);
 
-	if (context_mode && dual_input_enabled && extra_hero_count && idx == 0 && r) {
+	if (dual_input_enabled && extra_hero_count && idx == 0 && r) {
 		DWORD* world = *(DWORD**)g_world_ptr;
 		DWORD* hero0 = world ? (DWORD*)world[0x230 / 4] : NULL;
 		if (r == hero0) {
-			DWORD* ctx = context_hero_from_stack("get_hero(0)", (DWORD)_ReturnAddress());
-			if (ctx)
-				return ctx;
+			// state code that our wrappers know belongs to an extra hero gets that hero
+			if (is_extra_hero(state_ctx_entity))
+				return state_ctx_entity;
+			if (context_mode) {
+				DWORD* ctx = context_hero_from_stack("get_hero(0)", (DWORD)_ReturnAddress());
+				if (ctx)
+					return ctx;
+			}
 		}
 	}
 	return r;
@@ -1359,10 +1457,14 @@ DWORD* __cdecl find_entity_by_name_hook(void* name, int type, int flag) {
 		return main_cam;
 
 	// code running on an extra hero's own objects that asks for "HERO" gets that hero, not player 1
-	if (hero_kind == 2 && context_mode && dual_input_enabled && have_name && !_stricmp(nm, "HERO")) {
-		DWORD* ctx = context_hero_from_stack("lookup 'HERO'", (DWORD)_ReturnAddress());
-		if (ctx)
-			return ctx;
+	if (hero_kind == 2 && dual_input_enabled && have_name && !_stricmp(nm, "HERO")) {
+		if (is_extra_hero(state_ctx_entity))
+			return state_ctx_entity;
+		if (context_mode) {
+			DWORD* ctx = context_hero_from_stack("lookup 'HERO'", (DWORD)_ReturnAddress());
+			if (ctx)
+				return ctx;
+		}
 	}
 	return r;
 }
@@ -1601,13 +1703,60 @@ static void log_state_object(const char* tag, void* this) {
 }
 
 int __fastcall state_473650_hook(void* this, void* edx, int arg) {
+	DWORD* ent = NULL;
+	DWORD* prev_ctx = state_ctx_entity;
+	int swapped = 0;
+	int r;
+
 	log_state_object("steer", this);
-	return state_473650_original(this, edx, arg);
+	__try {
+		ent = (DWORD*)((DWORD*)this)[0x18 / 4];
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		ent = NULL;
+	}
+
+	if (context_mode && dual_input_enabled && extra_hero_count && ent) {
+		state_ctx_entity = ent;
+		swapped = swap_in_controller_values(ent);
+		if (swapped && ctrl_swap_logs < 8) {
+			int diff = 0;
+			for (int i = 0; i < ctrl_snap_len[0] && i < ctrl_snap_len[1]; i++)
+				if (ctrl_snap[0][i] != ctrl_snap[1][i])
+					diff++;
+			ctrl_swap_logs++;
+			twop_log("[CTRLSW] steer for %s uses the player %d controller values (P1/P2 snapshots differ in %d bytes)\n",
+				is_extra_hero(ent) ? "an EXTRA hero" : "hero 0", is_extra_hero(ent) ? 2 : 1, diff);
+		}
+	}
+
+	r = state_473650_original(this, edx, arg);
+
+	if (swapped)
+		swap_out_controller_values();
+	state_ctx_entity = prev_ctx;
+	return r;
 }
 
 int __fastcall state_47DDD0_hook(void* this, void* edx, int arg) {
+	DWORD* ent = NULL;
+	DWORD* prev_ctx = state_ctx_entity;
+	int r;
+
 	log_state_object("enter-swing", this);
-	return state_47DDD0_original(this, edx, arg);
+	__try {
+		ent = (DWORD*)((DWORD*)this)[0x18 / 4];
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		ent = NULL;
+	}
+	if (context_mode && dual_input_enabled && extra_hero_count && ent)
+		state_ctx_entity = ent;
+
+	r = state_47DDD0_original(this, edx, arg);
+
+	state_ctx_entity = prev_ctx;
+	return r;
 }
 
 static void patch_vtable_slot(DWORD slot_addr, DWORD expected, void* hook, const char* name) {
