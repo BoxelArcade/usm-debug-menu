@@ -1977,6 +1977,8 @@ typedef struct {
 	unsigned tick;
 	DWORD caller, self, ctx, ent, ctrl, arg, argcmp;
 	int ret, mode0, prev0, mode1, prev1, v838, v834, v830, b0B, b07, b01, h0, h1;
+	DWORD phys, w0C, t180;   // entity+0x1C object: word +0xC (bit 12), timestamp +0x180
+	int f184;                // byte +0x184 (0x4BDE00 reads it)
 } helper_rec;
 
 #define HELPER_RING 256
@@ -2019,10 +2021,10 @@ static void helper_print(const helper_rec* r, const char* tag) {
 		return;
 	helper_lines++;
 	describe_owner(r->ent, who);
-	twop_log("[HELP] %s f=%u from %08X this=%08X ctx=%08X ent=%08X (%s) ctrl=%08X arg=%08X (==K95836C: %d) | K838=%d K834=%d K830=%d | btn0B=%04X btn07=%04X btn01=%04X | mode %d->%d prev %d->%d ret=%d | hero0=%d extra0=%d\n",
+	twop_log("[HELP] %s f=%u from %08X this=%08X ctx=%08X ent=%08X (%s) ctrl=%08X arg=%08X (==K95836C: %d) | K838=%d K834=%d K830=%d | btn0B=%04X btn07=%04X btn01=%04X | mode %d->%d prev %d->%d ret=%d | phys=%08X f184=%d (0x4BDE00=%d) bit12(+0xC)=%d t180=%u | hero0=%d extra0=%d\n",
 		tag, r->tick, (unsigned)r->caller, (unsigned)r->self, (unsigned)r->ctx, (unsigned)r->ent, who, (unsigned)r->ctrl,
 		(unsigned)r->arg, (int)r->argcmp, r->v838, r->v834, r->v830, r->b0B & 0xFFFF, r->b07 & 0xFFFF, r->b01 & 0xFFFF,
-		r->mode0, r->mode1, r->prev0, r->prev1, r->ret, r->h0, r->h1);
+		r->mode0, r->mode1, r->prev0, r->prev1, r->ret, (unsigned)r->phys, r->f184, r->f184 != 0, (int)((r->w0C >> 12) & 1), (unsigned)r->t180, r->h0, r->h1);
 }
 
 static void helper_swing_flush(void) {
@@ -2079,6 +2081,14 @@ int __fastcall helper_hook(void* this, void* edx, int arg) {
 			r.v838 = helper_var((void*)r.ctx, *(DWORD*)0x0096C838);
 			r.v834 = helper_var((void*)r.ctx, *(DWORD*)0x0096C834);
 			r.v830 = helper_var((void*)r.ctx, *(DWORD*)0x0096C830);
+			if (r.ent) {
+				r.phys = *(DWORD*)(r.ent + 0x1C);
+				if (r.phys) {
+					r.f184 = *(BYTE*)(r.phys + 0x184);
+					r.t180 = *(DWORD*)(r.phys + 0x180);
+					r.w0C = *(DWORD*)(r.phys + 0xC);
+				}
+			}
 			if (r.ctrl) {
 				r.b0B = helper_button_flags((void*)r.ctrl, 0xB);
 				r.b07 = helper_button_flags((void*)r.ctrl, 7);
@@ -2090,6 +2100,33 @@ int __fastcall helper_hook(void* this, void* edx, int arg) {
 	}
 	diag_busy = 0;
 
+	{
+		// log every change of the ground flag (+0x184) / bit 12 per physics object, in any frame
+		static struct { DWORD phys; int f; int b12; } seen[8];
+		static int nseen = 0, flip_logs = 0;
+		if (r.phys) {
+			int k = -1;
+			for (int i = 0; i < nseen; i++)
+				if (seen[i].phys == r.phys)
+					k = i;
+			if (k < 0 && nseen < 8) {
+				k = nseen++;
+				seen[k].phys = r.phys;
+				seen[k].f = -1;
+				seen[k].b12 = -1;
+			}
+			if (k >= 0 && flip_logs < 300 && (seen[k].f != r.f184 || seen[k].b12 != (int)((r.w0C >> 12) & 1))) {
+				char who[48];
+				describe_owner(r.ent, who);
+				flip_logs++;
+				twop_log("[FLAG] f=%u phys %08X (ent %08X %s ctx %08X): f184 %d -> %d, bit12 %d -> %d, t180=%u, from %08X (swing started f=%u) | hero0=%d extra0=%d\n",
+					r.tick, (unsigned)r.phys, (unsigned)r.ent, who, (unsigned)r.ctx, seen[k].f, r.f184, seen[k].b12, (int)((r.w0C >> 12) & 1),
+					(unsigned)r.t180, (unsigned)caller, swing_frame, r.h0, r.h1);
+				seen[k].f = r.f184;
+				seen[k].b12 = (int)((r.w0C >> 12) & 1);
+			}
+		}
+	}
 	helper_ring[helper_ring_n % HELPER_RING] = r;
 	helper_ring_n++;
 	if (r.tick <= helper_live_until && r.tick >= helper_live_until - 2)
