@@ -1610,6 +1610,11 @@ void install_hero_input_probe(void) {
  */
 unsigned tick_count = 0;
 
+#define MSG_SEEN_MAX 48
+static struct { int msg; DWORD owner; DWORD caller; } msg_seen[MSG_SEEN_MAX];
+static int msg_seen_count = 0;
+static int msg_logs = 0;
+
 static int mode_of_entity(DWORD* ent) {
 	int m = -2;
 	if (!ent)
@@ -1648,6 +1653,7 @@ static void monitor_modes(void) {
 	}
 	for (int i = 0; i < n; i++) {
 		if (cur[i] != last[i]) {
+			msg_seen_count = 0;   // log the distinct messages again after every mode change
 			lines++;
 			if (i == 0)
 				twop_log("[MODE] f=%u hero 0: %d -> %d\n", tick_count, last[i], cur[i]);
@@ -1857,6 +1863,60 @@ int __fastcall enter_ground_hook(void* this, void* edx, int a1, int a2, int a3, 
 	return enter_ground_original(this, edx, a1, a2, a3, a4, a5);
 }
 
+/*
+ * Brain message handler 0x00467E10 (vtable slot 0x87D3C8, thiscall, 2 stack args, ret 8). this[0xC] is the
+ * receiving hero entity. The message id (0..17) is mapped through the byte table at 0x467F88 to a case
+ * that delivers the message to one of the brain's 0x34-byte event channels (brain+0x18, 0x4C, 0x80, 0xB4,
+ * 0xE8, 0x11C, 0x1B8, 0x254, 0x288). The other hero's forced jump enters through case 5 (channel
+ * brain+0x1B8, message ids 5, 11, 12). This probe logs each distinct (message, receiver, caller) after
+ * every mode change; the FIRST address after "caller" is the real sender (the return address at entry),
+ * the rest is only stack residue.
+ */
+typedef int(__fastcall* brain_msg_ptr)(void* this, void* edx, int msg, int arg);
+brain_msg_ptr brain_msg_original = (void*)0x00467E10;
+
+int __fastcall brain_msg_hook(void* this, void* edx, int msg, int arg) {
+	if (extra_hero_count && msg_logs < 400) {
+		DWORD owner = 0;
+		DWORD caller = (DWORD)_ReturnAddress();
+		int known = 0;
+
+		__try {
+			owner = ((DWORD*)this)[0xC / 4];
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) {
+			owner = 0;
+		}
+		for (int i = 0; i < msg_seen_count; i++)
+			if (msg_seen[i].msg == msg && msg_seen[i].owner == owner && msg_seen[i].caller == caller)
+				known = 1;
+
+		if (!known && msg_seen_count < MSG_SEEN_MAX) {
+			DWORD* world = *(DWORD**)g_world_ptr;
+			DWORD* hero0 = world ? (DWORD*)world[0x230 / 4] : NULL;
+			char who[48], line[300];
+			DWORD ra[5];
+			int n, len;
+
+			msg_seen[msg_seen_count].msg = msg;
+			msg_seen[msg_seen_count].owner = owner;
+			msg_seen[msg_seen_count].caller = caller;
+			msg_seen_count++;
+			msg_logs++;
+
+			describe_owner(owner, who);
+			n = collect_return_addrs(ra, 4);
+			len = sprintf(line, "[MSG] f=%u msg %d -> receiver %08X (%s) arg=%08X | caller %08X | modes hero0=%d extra0=%d | stack:",
+				tick_count, msg, (unsigned)owner, who, (unsigned)arg, (unsigned)caller,
+				mode_of_entity(hero0), extra_hero_count ? mode_of_entity(extra_heroes[0]) : -9);
+			for (int i = 0; i < n && len < 270; i++)
+				len += sprintf(line + len, " %08X", (unsigned)ra[i]);
+			twop_log("%s\n", line);
+		}
+	}
+	return brain_msg_original(this, edx, msg, arg);
+}
+
 static void patch_vtable_slot(DWORD slot_addr, DWORD expected, void* hook, const char* name) {
 	DWORD* slot = (DWORD*)slot_addr;
 	DWORD old;
@@ -1878,6 +1938,7 @@ void install_swing_probes(void) {
 	patch_vtable_slot(0x008774D0, 0x0047DA60, enter_swing_hook, "enter-swing (0x47DA60)");
 	patch_vtable_slot(0x008775C8, 0x0045D340, enter_nine_hook, "enter mode 9 (0x45D340)");
 	patch_vtable_slot(0x00877490, 0x004584E0, enter_ground_hook, "enter-ground (0x4584E0)");
+	patch_vtable_slot(0x0087D3C8, 0x00467E10, brain_msg_hook, "brain message handler (0x467E10)");
 }
 
 /*
