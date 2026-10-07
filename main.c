@@ -1610,6 +1610,29 @@ void install_hero_input_probe(void) {
  */
 unsigned tick_count = 0;
 
+/*
+ * ---- cross-hero swing -> jump filter -------------------------------------------------------
+ * Findings from the logs: when one hero enters swing, the OTHER hero's own state machine takes the
+ * ground->jump transition one frame later (no raw input on his pad). Every button read in a hero's
+ * transition code goes through the brain query 0x467E10 (this[0xC] = receiving hero, args = output
+ * buffer, button index; the buffer's word at +0x32 holds the flags: bit0 held, bit1 pressed, bit5
+ * consumed). For SWING_FILTER_FRAMES frames after a hero starts swinging we clear the held/pressed
+ * bits of every query that is NOT for the swinging hero, and log each query that would have
+ * reported held/pressed so the next log shows exactly which button index leaks.
+ * F6 toggles the filter (default ON).
+ */
+#define SWING_FILTER_FRAMES 3
+int swing_filter_on = 1;
+static DWORD last_query_receiver = 0;      // hero whose update is running (receiver of the last query)
+static DWORD swing_owner = 0;              // hero that entered swing most recently
+static unsigned swing_frame = 0;
+static int trig_logs = 0;
+static int filter_logs = 0;
+static unsigned filter_hits = 0;
+// raw device state seen by the DirectInput hook, per pass (0 = pad 0 / keyboard+mouse, 1 = pad 1 / gamepad)
+volatile DWORD raw_buttons[2];
+volatile int raw_keys_down[2];
+
 #define MSG_SEEN_MAX 48
 static struct { int msg; DWORD owner; DWORD caller; } msg_seen[MSG_SEEN_MAX];
 static int msg_seen_count = 0;
@@ -1851,6 +1874,8 @@ int __fastcall enter_jump_hook(void* this, void* edx, int a1, int a2, int a3, in
 	return enter_jump_original(this, edx, a1, a2, a3, a4, a5);
 }
 int __fastcall enter_swing_hook(void* this, void* edx, int a1, int a2, int a3, int a4, int a5) {
+	swing_owner = last_query_receiver;
+	swing_frame = tick_count;
 	log_state_enter("ENTER-SWING(3)", this);
 	return enter_swing_original(this, edx, a1, a2, a3, a4, a5);
 }
@@ -1875,46 +1900,49 @@ int __fastcall enter_ground_hook(void* this, void* edx, int a1, int a2, int a3, 
 typedef int(__fastcall* brain_msg_ptr)(void* this, void* edx, int msg, int arg);
 brain_msg_ptr brain_msg_original = (void*)0x00467E10;
 
-int __fastcall brain_msg_hook(void* this, void* edx, int msg, int arg) {
-	if (extra_hero_count && msg_logs < 400) {
-		DWORD owner = 0;
-		DWORD caller = (DWORD)_ReturnAddress();
-		int known = 0;
+int __fastcall brain_msg_hook(void* this, void* edx, int outbuf, int idx) {
+	DWORD owner = 0;
+	DWORD caller = (DWORD)_ReturnAddress();
+	int r;
+
+	__try {
+		owner = ((DWORD*)this)[0xC / 4];
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		owner = 0;
+	}
+	last_query_receiver = owner;
+
+	r = brain_msg_original(this, edx, outbuf, idx);
+
+	if (extra_hero_count && outbuf) {
+		WORD flags = 0;
+		int in_window = swing_owner && owner != swing_owner && tick_count >= swing_frame && tick_count - swing_frame <= SWING_FILTER_FRAMES;
 
 		__try {
-			owner = ((DWORD*)this)[0xC / 4];
+			flags = *(WORD*)((BYTE*)outbuf + 0x32);
 		}
 		__except (EXCEPTION_EXECUTE_HANDLER) {
-			owner = 0;
+			flags = 0;
 		}
-		for (int i = 0; i < msg_seen_count; i++)
-			if (msg_seen[i].msg == msg && msg_seen[i].owner == owner && msg_seen[i].caller == caller)
-				known = 1;
 
-		if (!known && msg_seen_count < MSG_SEEN_MAX) {
-			DWORD* world = *(DWORD**)g_world_ptr;
-			DWORD* hero0 = world ? (DWORD*)world[0x230 / 4] : NULL;
-			char who[48], line[300];
-			DWORD ra[5];
-			int n, len;
-
-			msg_seen[msg_seen_count].msg = msg;
-			msg_seen[msg_seen_count].owner = owner;
-			msg_seen[msg_seen_count].caller = caller;
-			msg_seen_count++;
-			msg_logs++;
-
+		if (in_window && (flags & 3) && !(flags & 0x20)) {
+			char who[48], sw[48];
 			describe_owner(owner, who);
-			n = collect_return_addrs(ra, 4);
-			len = sprintf(line, "[MSG] f=%u msg %d -> receiver %08X (%s) arg=%08X | caller %08X | modes hero0=%d extra0=%d | stack:",
-				tick_count, msg, (unsigned)owner, who, (unsigned)arg, (unsigned)caller,
-				mode_of_entity(hero0), extra_hero_count ? mode_of_entity(extra_heroes[0]) : -9);
-			for (int i = 0; i < n && len < 270; i++)
-				len += sprintf(line + len, " %08X", (unsigned)ra[i]);
-			twop_log("%s\n", line);
+			describe_owner(swing_owner, sw);
+			if (trig_logs < 120) {
+				trig_logs++;
+				twop_log("[TRIG] f=%u (swing started f=%u by %s) query by %s: button idx %d flags %04X (held=%d pressed=%d) caller %08X | raw: pad1 buttons %08X, kbd keys down %d | %s\n",
+					tick_count, swing_frame, sw, who, idx, (unsigned)flags, flags & 1, (flags >> 1) & 1, (unsigned)caller,
+					(unsigned)raw_buttons[1], raw_keys_down[0], swing_filter_on ? "SUPPRESSED" : "passed (filter off)");
+			}
+			if (swing_filter_on) {
+				*(WORD*)((BYTE*)outbuf + 0x32) = (WORD)(flags & ~3);
+				filter_hits++;
+			}
 		}
 	}
-	return brain_msg_original(this, edx, msg, arg);
+	return r;
 }
 
 static void patch_vtable_slot(DWORD slot_addr, DWORD expected, void* hook, const char* name) {
@@ -2618,6 +2646,25 @@ HRESULT __stdcall GetDeviceStateHook(IDirectInputDevice8* this, DWORD cbData, LP
 
 	//printf("Device State called %08X %d\n", this, cbData);
 
+	if (SUCCEEDED(res) && dual_input_enabled) {
+		int ps = input_pass ? 1 : 0;
+		if (cbData == sizeof(DIJOYSTATE2)) {
+			LPDIJOYSTATE2 jj = (LPDIJOYSTATE2)lpvData;
+			DWORD mask = 0;
+			for (int b = 0; b < 32; b++)
+				if (jj->rgbButtons[b] & 0x80)
+					mask |= 1u << b;
+			raw_buttons[ps] = mask;
+		}
+		else if (cbData == 256) {
+			int n = 0;
+			for (int b = 0; b < 256; b++)
+				if (((BYTE*)lpvData)[b] & 0x80)
+					n++;
+			raw_keys_down[ps] = n;
+		}
+	}
+
 	return res;
 }
 
@@ -2758,6 +2805,11 @@ int __fastcall game_handle_game_states(void* this, void* edx, void* a2) {
 	if (GetAsyncKeyState(VK_F7) & 1) {
 		context_mode = !context_mode;
 		twop_log("[CTX] context resolution %s\n", context_mode ? "ON" : "OFF");
+	}
+
+	if (GetAsyncKeyState(VK_F6) & 1) {
+		swing_filter_on = !swing_filter_on;
+		twop_log("[TRIG] cross-hero swing filter %s (suppressed so far: %u)\n", swing_filter_on ? "ON" : "OFF", filter_hits);
 	}
 
 	if (adding_second_player) {
