@@ -1619,16 +1619,18 @@ unsigned tick_count = 0;
  * consumed). For SWING_FILTER_FRAMES frames after a hero starts swinging we clear the held/pressed
  * bits of every query that is NOT for the swinging hero, and log each query that would have
  * reported held/pressed so the next log shows exactly which button index leaks.
- * F6 toggles the filter (default ON).
+ * F6 toggles the filter (default OFF now).
  */
 #define SWING_FILTER_FRAMES 3
-int swing_filter_on = 1;
+int swing_filter_on = 0;   // refuted by the last log (0 suppressions, spurious jump still happened); F6 turns it on
 static DWORD last_query_receiver = 0;      // hero whose update is running (receiver of the last query)
 static DWORD swing_owner = 0;              // hero that entered swing most recently
 static unsigned swing_frame = 0;
 static int trig_logs = 0;
 static int filter_logs = 0;
 static unsigned filter_hits = 0;
+static int diag_busy = 0;                  // set while our own diagnostics call the game's query functions
+static void helper_swing_flush(void);      // defined with the ground-transition helper probe
 // raw device state seen by the DirectInput hook, per pass (0 = pad 0 / keyboard+mouse, 1 = pad 1 / gamepad)
 volatile DWORD raw_buttons[2];
 volatile int raw_keys_down[2];
@@ -1876,6 +1878,7 @@ int __fastcall enter_jump_hook(void* this, void* edx, int a1, int a2, int a3, in
 int __fastcall enter_swing_hook(void* this, void* edx, int a1, int a2, int a3, int a4, int a5) {
 	swing_owner = last_query_receiver;
 	swing_frame = tick_count;
+	helper_swing_flush();
 	log_state_enter("ENTER-SWING(3)", this);
 	return enter_swing_original(this, edx, a1, a2, a3, a4, a5);
 }
@@ -1901,6 +1904,8 @@ typedef int(__fastcall* brain_msg_ptr)(void* this, void* edx, int msg, int arg);
 brain_msg_ptr brain_msg_original = (void*)0x00467E10;
 
 int __fastcall brain_msg_hook(void* this, void* edx, int outbuf, int idx) {
+	if (diag_busy)
+		return brain_msg_original(this, edx, outbuf, idx);
 	DWORD owner = 0;
 	DWORD caller = (DWORD)_ReturnAddress();
 	int r;
@@ -1943,6 +1948,164 @@ int __fastcall brain_msg_hook(void* this, void* edx, int outbuf, int idx) {
 		}
 	}
 	return r;
+}
+
+/*
+ * ---- ground/air transition helper probe (0x006A7110) ----------------------------------------
+ * 0x006A7110 (thiscall, one stack arg = action id, ret 4) is what the state updates call to pick
+ * the next locomotion mode; the ENTER-JUMP chain `006CD511 004885FC 006CDCC2 006A7349` is the
+ * residue of it. It is called from 9 sites (0x44CF4E, 0x47E0DA, 0x47E484, 0x47E5D3, 0x488962,
+ * 0x488F0F, 0x489139, 0x48927D, 0x4892EA). `this` = locomotion object: +0x08 = context (lookup
+ * table), +0x50 = new mode, +0x54 = previous mode. Static reading of the function:
+ *   1. returns false at once when variable K838 (context+0x50 map, key [0x96C838]) is 0
+ *   2. [12] = (K834 == 1); the context also yields controller (key [0x95855C]) and entity ([0x96C290])
+ *   3. if arg == [0x95836C] and (K830 != 0 or K834 == 1): button 0xB pressed (flags bit1, not bit5)
+ *        and K834 != 1  -> mode = 6 (JUMP)         <- the jump branch (0x6A7412)
+ *        button 0xB not pressed, button 7 pressed -> modes 5 / 8 / 6 via stick and object checks
+ *   4. otherwise the 0x6A7563 branch (modes 0xB, 0x14, 0, or 9 / 0xF / 1 through buttons 0xB and 7)
+ * The hook runs the original, then records inputs and the outcome in a ring buffer. A swing start
+ * (enter-swing) prints the last 2 frames from the ring and then every call for the next 2 frames.
+ */
+typedef int(__fastcall* helper_fn)(void* this, void* edx, int arg);
+helper_fn helper_original = (void*)0x006A7110;
+typedef int(__fastcall* var_lookup_fn)(void* map, void* edx, DWORD key);
+typedef void*(__fastcall* ctx_lookup_fn)(void* ctx, void* edx, DWORD key, int one);
+typedef void*(__fastcall* btn_query_fn)(void* ctrl, void* edx, void* out, int idx);
+typedef void(__fastcall* node_free_fn)(void* node, void* edx);
+
+typedef struct {
+	unsigned tick;
+	DWORD caller, self, ctx, ent, ctrl, arg, argcmp;
+	int ret, mode0, prev0, mode1, prev1, v838, v834, v830, b0B, b07, b01, h0, h1;
+} helper_rec;
+
+#define HELPER_RING 256
+#define HELPER_LINES_MAX 1500
+static helper_rec helper_ring[HELPER_RING];
+static unsigned helper_ring_n = 0;
+static unsigned helper_live_until = 0;
+static int helper_lines = 0;
+
+static int helper_button_flags(void* ctrl, int idx) {
+	BYTE buf[0x60];
+	int flags = -1;
+	memset(buf, 0, sizeof(buf));
+	__try {
+		btn_query_fn q = (btn_query_fn)(*(DWORD**)ctrl)[0x58 / 4];
+		q(ctrl, NULL, buf, idx);
+		flags = *(WORD*)(buf + 0x32);
+		((node_free_fn)0x0048C6F0)(buf, NULL);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		flags = -2;
+	}
+	return flags;
+}
+
+static int helper_var(void* ctx, DWORD key) {
+	int v = -999;
+	__try {
+		v = ((var_lookup_fn)0x006CDCA0)((BYTE*)ctx + 0x50, NULL, key);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		v = -998;
+	}
+	return v;
+}
+
+static void helper_print(const helper_rec* r, const char* tag) {
+	char who[48];
+	if (helper_lines >= HELPER_LINES_MAX)
+		return;
+	helper_lines++;
+	describe_owner(r->ent, who);
+	twop_log("[HELP] %s f=%u from %08X this=%08X ctx=%08X ent=%08X (%s) ctrl=%08X arg=%08X (==K95836C: %d) | K838=%d K834=%d K830=%d | btn0B=%04X btn07=%04X btn01=%04X | mode %d->%d prev %d->%d ret=%d | hero0=%d extra0=%d\n",
+		tag, r->tick, (unsigned)r->caller, (unsigned)r->self, (unsigned)r->ctx, (unsigned)r->ent, who, (unsigned)r->ctrl,
+		(unsigned)r->arg, (int)r->argcmp, r->v838, r->v834, r->v830, r->b0B & 0xFFFF, r->b07 & 0xFFFF, r->b01 & 0xFFFF,
+		r->mode0, r->mode1, r->prev0, r->prev1, r->ret, r->h0, r->h1);
+}
+
+static void helper_swing_flush(void) {
+	unsigned n = helper_ring_n < HELPER_RING ? helper_ring_n : HELPER_RING;
+	if (!extra_hero_count)
+		return;
+	twop_log("[HELP] ---- enter-swing at f=%u (owner guess %08X): previous 2 frames, then 2 frames after ----\n", tick_count, (unsigned)swing_owner);
+	for (unsigned i = 0; i < n; i++) {
+		const helper_rec* r = &helper_ring[(helper_ring_n - n + i) % HELPER_RING];
+		if (r->tick + 2 >= tick_count)
+			helper_print(r, "before");
+	}
+	helper_live_until = tick_count + 2;
+}
+
+int __fastcall helper_hook(void* this, void* edx, int arg) {
+	helper_rec r;
+	DWORD* t = (DWORD*)this;
+	DWORD caller = (DWORD)_ReturnAddress();
+	int ret;
+
+	memset(&r, 0, sizeof(r));
+	r.mode0 = r.prev0 = r.mode1 = r.prev1 = -9;
+	__try {
+		r.mode0 = (int)t[0x50 / 4];
+		r.prev0 = (int)t[0x54 / 4];
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+	}
+
+	ret = helper_original(this, edx, arg);
+
+	if (!extra_hero_count || diag_busy)
+		return ret;
+
+	diag_busy = 1;
+	r.tick = tick_count;
+	r.caller = caller;
+	r.self = (DWORD)this;
+	r.arg = (DWORD)arg;
+	r.ret = ret & 0xFF;
+	__try {
+		DWORD* world = *(DWORD**)g_world_ptr;
+		DWORD* hero0 = world ? (DWORD*)world[0x230 / 4] : NULL;
+		r.mode1 = (int)t[0x50 / 4];
+		r.prev1 = (int)t[0x54 / 4];
+		r.ctx = t[8 / 4];
+		r.argcmp = (DWORD)arg == *(DWORD*)0x0095836C;
+		r.h0 = mode_of_entity(hero0);
+		r.h1 = mode_of_entity(extra_heroes[0]);
+		if (r.ctx) {
+			r.ctrl = (DWORD)((ctx_lookup_fn)0x006A3390)((void*)r.ctx, NULL, *(DWORD*)0x0095855C, 1);
+			r.ent = (DWORD)((ctx_lookup_fn)0x006A3390)((void*)r.ctx, NULL, *(DWORD*)0x0096C290, 1);
+			r.v838 = helper_var((void*)r.ctx, *(DWORD*)0x0096C838);
+			r.v834 = helper_var((void*)r.ctx, *(DWORD*)0x0096C834);
+			r.v830 = helper_var((void*)r.ctx, *(DWORD*)0x0096C830);
+			if (r.ctrl) {
+				r.b0B = helper_button_flags((void*)r.ctrl, 0xB);
+				r.b07 = helper_button_flags((void*)r.ctrl, 7);
+				r.b01 = helper_button_flags((void*)r.ctrl, 1);
+			}
+		}
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+	}
+	diag_busy = 0;
+
+	helper_ring[helper_ring_n % HELPER_RING] = r;
+	helper_ring_n++;
+	if (r.tick <= helper_live_until && r.tick >= helper_live_until - 2)
+		helper_print(&r, "after ");
+	return ret;
+}
+
+static const DWORD helper_sites[] = {
+	0x0044CF4E, 0x0047E0DA, 0x0047E484, 0x0047E5D3, 0x00488962, 0x00488F0F, 0x00489139, 0x0048927D, 0x004892EA
+};
+
+void install_helper_hooks(void) {
+	int n = (int)(sizeof(helper_sites) / sizeof(helper_sites[0]));
+	for (int i = 0; i < n; i++)
+		HookFunc(helper_sites[i], helper_hook, 0, "Hooking a 0x6A7110 call site (transition helper probe)");
+	twop_log("[HELP] transition helper probe installed on %d call sites\n", n);
 }
 
 static void patch_vtable_slot(DWORD slot_addr, DWORD expected, void* hook, const char* name) {
@@ -3392,6 +3555,7 @@ void install_patches() {
 	install_add_player_name_hooks();
 	install_get_hero_hooks();
 	install_swing_probes();
+	install_helper_hooks();
 
 
 	/*
