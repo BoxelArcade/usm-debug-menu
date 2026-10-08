@@ -1993,7 +1993,8 @@ static int helper_lines = 0;
  * Last logs: the frame a hero enters swing, the physics update (0x4F11F0 -> 0x4F1F94 clears the
  * byte at phys+0x184, then 0x4ECC10 would recompute it) leaves the OTHER hero's ground flag at 0.
  * One frame later his transition helper (0x6A7110, 0x6A7563 branch) sees "not on ground" and takes
- * mode 0 = jump. For the frames swing_frame..swing_frame+2 we put the flag back to 1 for the hero
+ * mode 0 = jump. The last log showed it stays 0 for the whole swing (the fix held 3 frames, then the jump
+ * came), so now: for 3 frames after a swing start AND while any hero is in swing mode 3, we put the flag back to 1 for the hero
  * that is in ground mode (1), but only if we saw it at 1 before. (The first version picked the
  * swinger as the owner of the last helper call, which was the wrong hero: no fix ever fired.) F6 toggles (default ON).
  */
@@ -2145,6 +2146,22 @@ static void watch_arm(DWORD addr) {
 	watch_n++;
 }
 
+static int any_hero_swinging(void) {
+	int sw = 0;
+	__try {
+		DWORD* world = *(DWORD**)g_world_ptr;
+		DWORD* hero0 = world ? (DWORD*)world[0x230 / 4] : NULL;
+		if (hero0 && mode_of_entity(hero0) == 3)
+			sw = 1;
+		for (int i = 0; i < extra_hero_count; i++)
+			if (extra_heroes[i] && mode_of_entity(extra_heroes[i]) == 3)
+				sw = 1;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+	}
+	return sw;
+}
+
 int __fastcall helper_hook(void* this, void* edx, int arg) {
 	helper_rec r;
 	DWORD* t = (DWORD*)this;
@@ -2160,7 +2177,7 @@ int __fastcall helper_hook(void* this, void* edx, int arg) {
 	__except (EXCEPTION_EXECUTE_HANDLER) {
 	}
 
-	if (ground_keep_on && extra_hero_count && !diag_busy && swing_frame && tick_count >= swing_frame && tick_count <= swing_frame + 3) {
+	if (ground_keep_on && extra_hero_count && !diag_busy && ((swing_frame && tick_count >= swing_frame && tick_count <= swing_frame + 3) || any_hero_swinging())) {
 		__try {
 			DWORD ctx = t[8 / 4];
 			if (ctx) {
