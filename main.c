@@ -2040,6 +2040,93 @@ static void helper_swing_flush(void) {
 	helper_live_until = tick_count + 2;
 }
 
+/*
+ * ---- hardware write watch on the ground flag (+0x184) ---------------------------------------
+ * The last log: at every swing start, the byte at phys+0x184 of the OTHER hero's physics object
+ * (entity+0x1C) goes 1 -> 0 one frame later, and his helper then returns mode 0 (jump). To find
+ * the code that clears it, the first two such objects get a hardware write breakpoint (DR0/DR1,
+ * 1 byte). The vectored handler logs the writing instruction (EIP), the new value, the frame and
+ * the return addresses on the stack. Only writes of 0, or writes within 3 frames of a swing start,
+ * are logged (max 400 lines).
+ */
+static volatile DWORD watch_addr[2];
+static int watch_n = 0;
+static int watch_logs = 0;
+
+static LONG CALLBACK watch_veh(PEXCEPTION_POINTERS ep) {
+	CONTEXT* c = ep->ContextRecord;
+	if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP || !(c->Dr6 & 3))
+		return EXCEPTION_CONTINUE_SEARCH;
+	{
+		int slot = (c->Dr6 & 1) ? 0 : 1;
+		DWORD addr = watch_addr[slot];
+		int val = -1;
+		int near_swing = tick_count + 3 >= swing_frame && tick_count <= swing_frame + 3;
+		__try {
+			val = *(BYTE*)addr;
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) {
+		}
+		if (watch_logs < 400 && (val == 0 || near_swing)) {
+			char line[400];
+			int len;
+			DWORD* sp = (DWORD*)c->Esp;
+			int n = 0;
+			watch_logs++;
+			len = sprintf(line, "[WATCH] f=%u write to %08X (slot %d) -> %d by code at %08X | swing started f=%u | hero0=%d extra0=%d | stack:",
+				tick_count, (unsigned)addr, slot, val, (unsigned)c->Eip, swing_frame,
+				-9, -9);
+			__try {
+				for (int i = 0; i < 400 && n < 8; i++) {
+					DWORD v = sp[i];
+					if (v >= 0x00401000 && v < 0x0086F000) {
+						BYTE* b = (BYTE*)v;
+						if (b[-5] == 0xE8 || (b[-2] == 0xFF && (b[-1] & 0x38) == 0x10) || (b[-3] == 0xFF && (b[-2] & 0x38) == 0x10) || (b[-6] == 0xFF && (b[-5] & 0x38) == 0x10)) {
+							len += sprintf(line + len, " %08X", (unsigned)v);
+							n++;
+						}
+					}
+				}
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+			}
+			twop_log("%s\n", line);
+		}
+		c->Dr6 = 0;
+	}
+	return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+static void watch_arm(DWORD addr) {
+	CONTEXT c;
+	for (int i = 0; i < watch_n; i++)
+		if (watch_addr[i] == addr)
+			return;
+	if (watch_n >= 2)
+		return;
+	memset(&c, 0, sizeof(c));
+	c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+	if (!GetThreadContext(GetCurrentThread(), &c)) {
+		twop_log("[WATCH] GetThreadContext failed (%lu)\n", GetLastError());
+		return;
+	}
+	watch_addr[watch_n] = addr;
+	if (watch_n == 0) {
+		c.Dr0 = addr;
+		c.Dr7 |= 0x1u | (1u << 16);                  // L0, write, length 1
+	}
+	else {
+		c.Dr1 = addr;
+		c.Dr7 |= (1u << 2) | (1u << 20);              // L1, write, length 1
+	}
+	if (!SetThreadContext(GetCurrentThread(), &c)) {
+		twop_log("[WATCH] SetThreadContext failed (%lu)\n", GetLastError());
+		return;
+	}
+	twop_log("[WATCH] armed hardware write watch %d on %08X\n", watch_n, (unsigned)addr);
+	watch_n++;
+}
+
 int __fastcall helper_hook(void* this, void* edx, int arg) {
 	helper_rec r;
 	DWORD* t = (DWORD*)this;
@@ -2087,6 +2174,7 @@ int __fastcall helper_hook(void* this, void* edx, int arg) {
 					r.f184 = *(BYTE*)(r.phys + 0x184);
 					r.t180 = *(DWORD*)(r.phys + 0x180);
 					r.w0C = *(DWORD*)(r.phys + 0xC);
+					watch_arm(r.phys + 0x184);
 				}
 			}
 			if (r.ctrl) {
@@ -2142,6 +2230,7 @@ void install_helper_hooks(void) {
 	int n = (int)(sizeof(helper_sites) / sizeof(helper_sites[0]));
 	for (int i = 0; i < n; i++)
 		HookFunc(helper_sites[i], helper_hook, 0, "Hooking a 0x6A7110 call site (transition helper probe)");
+	AddVectoredExceptionHandler(1, watch_veh);
 	twop_log("[HELP] transition helper probe installed on %d call sites\n", n);
 }
 
