@@ -2346,6 +2346,21 @@ void __fastcall load_hero_pack_hook(void* this, void* edx, char* name, int flag)
 	load_hero_pack_original(this, edx, name, flag);
 }
 
+/*
+ * Different character for the second hero (experimental, F11 toggles, default OFF).
+ * add_player (0x55B400) only requests a character pack for player 0 (it calls 0x55A420 = copy the
+ * name into the game state + queue the pack with the streamer). The second hero is built through a
+ * shadow world with count 0, so that path normally runs too, but we skip it (pack of the first
+ * hero is already resident) and force the same character. With F11 on and a different character
+ * chosen in the "Add 2nd Player" menu, spawning is split in two phases:
+ *   1. call the game's own pack request for the new character, restore the current-hero name, and
+ *      let the game run for 180 frames so the streamer can finish;
+ *   2. spawn the hero normally (still skipping the request) using that character's name.
+ * Log lines start with "[2P] different character".
+ */
+int allow_diff_pack = 0;
+static int second_pack_state = 0;   // 0 idle, 1 pack requested, waiting for the second phase
+
 static void spawn_second_hero(const char* costume) {
 
 	DWORD* world = *(DWORD**)g_world_ptr;
@@ -2389,9 +2404,30 @@ static void spawn_second_hero(const char* costume) {
 		memcpy(current, saved_name, 32);
 		current[32] = 0;
 		if (strcmp(costume, current) != 0) {
-			twop_log("[2P] '%s' is not the loaded character pack; spawning '%s' instead (a different pack can't be loaded yet)\n", costume, current);
-			strcpy(second_costume, current);
-			costume = second_costume;
+			if (allow_diff_pack) {
+				if (second_pack_state == 0) {
+					twop_log("[2P] different character '%s' (loaded: '%s'): requesting its pack now, the spawn follows in 180 frames\n", costume, current);
+					__try {
+						load_hero_pack_original(game_state_obj, NULL, (char*)costume, 0);
+					}
+					__except (EXCEPTION_EXECUTE_HANDLER) {
+						twop_log("[2P] different character: the pack request crashed, giving up\n");
+						memcpy(name_buf, saved_name, sizeof(saved_name));
+						return;
+					}
+					memcpy(name_buf, saved_name, sizeof(saved_name));   // keep the first hero's name as the current hero
+					second_pack_state = 1;
+					adding_second_player = 180;
+					return;
+				}
+				second_pack_state = 0;
+				twop_log("[2P] different character '%s': second phase, spawning with the pack requested earlier\n", costume);
+			}
+			else {
+				twop_log("[2P] '%s' is not the loaded character pack; spawning '%s' instead (F11 enables the experimental different-character path)\n", costume, current);
+				strcpy(second_costume, current);
+				costume = second_costume;
+			}
 		}
 	}
 	twop_log("[2P] spawning '%s' via shadow world %08X\n", costume, (unsigned)(DWORD)shadow);
@@ -3163,6 +3199,11 @@ int __fastcall game_handle_game_states(void* this, void* edx, void* a2) {
 	if (GetAsyncKeyState(VK_F7) & 1) {
 		context_mode = !context_mode;
 		twop_log("[CTX] context resolution %s\n", context_mode ? "ON" : "OFF");
+	}
+
+	if (GetAsyncKeyState(VK_F11) & 1) {
+		allow_diff_pack = !allow_diff_pack;
+		twop_log("[2P] different-character spawn %s\n", allow_diff_pack ? "ON (experimental)" : "OFF");
 	}
 
 	if (GetAsyncKeyState(VK_F6) & 1) {
