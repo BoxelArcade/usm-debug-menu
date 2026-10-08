@@ -1994,8 +1994,8 @@ static int helper_lines = 0;
  * byte at phys+0x184, then 0x4ECC10 would recompute it) leaves the OTHER hero's ground flag at 0.
  * One frame later his transition helper (0x6A7110, 0x6A7563 branch) sees "not on ground" and takes
  * mode 0 = jump. For the frames swing_frame..swing_frame+2 we put the flag back to 1 for the hero
- * that is NOT the swinger, but only if we saw it at 1 before. The swinger is the owner of the last
- * helper call before the enter-swing. F6 toggles (default ON).
+ * that is in ground mode (1), but only if we saw it at 1 before. (The first version picked the
+ * swinger as the owner of the last helper call, which was the wrong hero: no fix ever fired.) F6 toggles (default ON).
  */
 int ground_keep_on = 1;
 static DWORD swing_entity = 0;
@@ -2160,14 +2160,14 @@ int __fastcall helper_hook(void* this, void* edx, int arg) {
 	__except (EXCEPTION_EXECUTE_HANDLER) {
 	}
 
-	if (ground_keep_on && extra_hero_count && !diag_busy && swing_entity && tick_count >= swing_frame && tick_count <= swing_frame + 2) {
+	if (ground_keep_on && extra_hero_count && !diag_busy && swing_frame && tick_count >= swing_frame && tick_count <= swing_frame + 3) {
 		__try {
 			DWORD ctx = t[8 / 4];
 			if (ctx) {
 				DWORD ent = (DWORD)((ctx_lookup_fn)0x006A3390)((void*)ctx, NULL, *(DWORD*)0x0096C290, 1);
 				DWORD phys = ent ? *(DWORD*)(ent + 0x1C) : 0;
 				DWORD owner = phys ? *(DWORD*)(phys + 4) : 0;
-				if (owner && owner != swing_entity && *(BYTE*)(phys + 0x184) == 0) {
+				if (owner && mode_of_entity((DWORD*)owner) == 1 && *(BYTE*)(phys + 0x184) == 0) {   // victim = a hero standing in ground mode 1
 					int k = (gk_owner[0] == owner) ? 0 : (gk_owner[1] == owner) ? 1 : -1;
 					if (k >= 0 && gk_flag[k] == 1) {
 						*(BYTE*)(phys + 0x184) = 1;
