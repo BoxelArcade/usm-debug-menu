@@ -1988,6 +1988,23 @@ static unsigned helper_ring_n = 0;
 static unsigned helper_live_until = 0;
 static int helper_lines = 0;
 
+/*
+ * ---- ground-flag keep (the fix) ---------------------------------------------------------------
+ * Last logs: the frame a hero enters swing, the physics update (0x4F11F0 -> 0x4F1F94 clears the
+ * byte at phys+0x184, then 0x4ECC10 would recompute it) leaves the OTHER hero's ground flag at 0.
+ * One frame later his transition helper (0x6A7110, 0x6A7563 branch) sees "not on ground" and takes
+ * mode 0 = jump. For the frames swing_frame..swing_frame+2 we put the flag back to 1 for the hero
+ * that is NOT the swinger, but only if we saw it at 1 before. The swinger is the owner of the last
+ * helper call before the enter-swing. F6 toggles (default ON).
+ */
+int ground_keep_on = 1;
+static DWORD swing_entity = 0;
+static DWORD gk_owner[2];
+static int gk_flag[2] = { -1, -1 };
+static int gk_fix_logs = 0;
+static unsigned gk_fix_count = 0;
+static DWORD last_helper_owner = 0;
+
 static int helper_button_flags(void* ctrl, int idx) {
 	BYTE buf[0x60];
 	int flags = -1;
@@ -2031,7 +2048,8 @@ static void helper_swing_flush(void) {
 	unsigned n = helper_ring_n < HELPER_RING ? helper_ring_n : HELPER_RING;
 	if (!extra_hero_count)
 		return;
-	twop_log("[HELP] ---- enter-swing at f=%u (owner guess %08X): previous 2 frames, then 2 frames after ----\n", tick_count, (unsigned)swing_owner);
+	swing_entity = last_helper_owner;
+	twop_log("[HELP] ---- enter-swing at f=%u (owner guess %08X, swinging entity %08X): previous 2 frames, then 2 frames after ----\n", tick_count, (unsigned)swing_owner, (unsigned)swing_entity);
 	for (unsigned i = 0; i < n; i++) {
 		const helper_rec* r = &helper_ring[(helper_ring_n - n + i) % HELPER_RING];
 		if (r->tick + 2 >= tick_count)
@@ -2142,6 +2160,31 @@ int __fastcall helper_hook(void* this, void* edx, int arg) {
 	__except (EXCEPTION_EXECUTE_HANDLER) {
 	}
 
+	if (ground_keep_on && extra_hero_count && !diag_busy && swing_entity && tick_count >= swing_frame && tick_count <= swing_frame + 2) {
+		__try {
+			DWORD ctx = t[8 / 4];
+			if (ctx) {
+				DWORD ent = (DWORD)((ctx_lookup_fn)0x006A3390)((void*)ctx, NULL, *(DWORD*)0x0096C290, 1);
+				DWORD phys = ent ? *(DWORD*)(ent + 0x1C) : 0;
+				DWORD owner = phys ? *(DWORD*)(phys + 4) : 0;
+				if (owner && owner != swing_entity && *(BYTE*)(phys + 0x184) == 0) {
+					int k = (gk_owner[0] == owner) ? 0 : (gk_owner[1] == owner) ? 1 : -1;
+					if (k >= 0 && gk_flag[k] == 1) {
+						*(BYTE*)(phys + 0x184) = 1;
+						gk_fix_count++;
+						if (gk_fix_logs < 100) {
+							gk_fix_logs++;
+							twop_log("[FIX] f=%u kept ground flag of entity %08X (phys %08X) at 1 after swing of %08X (swing f=%u), helper caller %08X\n",
+								tick_count, (unsigned)owner, (unsigned)phys, (unsigned)swing_entity, swing_frame, (unsigned)caller);
+						}
+					}
+				}
+			}
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) {
+		}
+	}
+
 	ret = helper_original(this, edx, arg);
 
 	if (!extra_hero_count || diag_busy)
@@ -2175,6 +2218,15 @@ int __fastcall helper_hook(void* this, void* edx, int arg) {
 					r.t180 = *(DWORD*)(r.phys + 0x180);
 					r.w0C = *(DWORD*)(r.phys + 0xC);
 					watch_arm(r.phys + 0x184);
+					{
+						DWORD owner = *(DWORD*)(r.phys + 4);
+						int k = (gk_owner[0] == owner) ? 0 : (gk_owner[1] == owner) ? 1 : (gk_owner[0] == 0 ? 0 : (gk_owner[1] == 0 ? 1 : -1));
+						if (owner && k >= 0) {
+							gk_owner[k] = owner;
+							gk_flag[k] = r.f184;
+						}
+						last_helper_owner = owner;
+					}
 				}
 			}
 			if (r.ctrl) {
@@ -3097,8 +3149,8 @@ int __fastcall game_handle_game_states(void* this, void* edx, void* a2) {
 	}
 
 	if (GetAsyncKeyState(VK_F6) & 1) {
-		swing_filter_on = !swing_filter_on;
-		twop_log("[TRIG] cross-hero swing filter %s (suppressed so far: %u)\n", swing_filter_on ? "ON" : "OFF", filter_hits);
+		ground_keep_on = !ground_keep_on;
+		twop_log("[FIX] ground-flag keep %s (fixes so far: %u)\n", ground_keep_on ? "ON" : "OFF", gk_fix_count);
 	}
 
 	if (adding_second_player) {
