@@ -2407,11 +2407,13 @@ static void spawn_second_hero(const char* costume) {
 			if (allow_diff_pack) {
 				if (second_pack_state == 0) {
 					twop_log("[2P] different character '%s' (loaded: '%s'): requesting its pack now, the spawn follows in 180 frames\n", costume, current);
+					twop_log("[2P] pack request inputs: game state %08X, streamer global [95C7F0]=%08X, name buffer %08X\n",
+						(unsigned)(DWORD)game_state_obj, (unsigned)*(DWORD*)0x0095C7F0, (unsigned)(DWORD)name_buf);
 					__try {
 						load_hero_pack_original(game_state_obj, NULL, (char*)costume, 0);
 					}
-					__except (EXCEPTION_EXECUTE_HANDLER) {
-						twop_log("[2P] different character: the pack request crashed, giving up\n");
+					__except (second_hero_filter(GetExceptionInformation())) {
+						twop_log("[2P] different character: the pack request crashed (details above), giving up\n");
 						memcpy(name_buf, saved_name, sizeof(saved_name));
 						return;
 					}
@@ -2924,6 +2926,25 @@ void menu_setup(int game_state, int keyboard) {
 				.data = (void*)0xFFFFFFFF
 			};
 			add_debug_menu_entry(options_menu, &time_of_day);
+
+			/*
+			 * The game's own debug flag table (names at 0x936500.., one byte per flag in [[0x96858C]+4]).
+			 * Calibrated with the two flags the menu already uses: LIVE_IN_GLASS_HOUSE (table slot
+			 * 0x936608) is byte 0x7A and RENDER_FE_UI (slot 0x936660) is byte 0x90, so byte =
+			 * 0x7A + (slot - 0x936608) / 4. Camera related flags:
+			 */
+			debug_menu_entry cam_editor = { "Camera Editor ", BOOLEAN_E, &flags[4 + 0x3A] };            // CAMERA_EDITOR
+			debug_menu_entry no_mouse_ctl = { "Disable Mouse Player Control ", BOOLEAN_E, &flags[4 + 0x3F] }; // DISABLE_MOUSE_PLAYER_CONTROL
+			debug_menu_entry xbox_user_cam = { "Xbox User Cam ", BOOLEAN_E, &flags[4 + 0x41] };         // XBOX_USER_CAM
+			debug_menu_entry cam_mouse = { "Camera Mouse Mode ", BOOLEAN_E, &flags[4 + 0x59] };          // CAMERA_MOUSE_MODE
+			debug_menu_entry usercam_c2 = { "User Cam On Controller 2 ", BOOLEAN_E, &flags[4 + 0x5A] };  // USERCAM_ON_CONTROLLER2
+			debug_menu_entry anchor_line = { "Show Anchor Line ", BOOLEAN_E, &flags[4 + 0x5C] };         // SHOW_ANCHOR_LINE
+			add_debug_menu_entry(options_menu, &cam_editor);
+			add_debug_menu_entry(options_menu, &xbox_user_cam);
+			add_debug_menu_entry(options_menu, &usercam_c2);
+			add_debug_menu_entry(options_menu, &cam_mouse);
+			add_debug_menu_entry(options_menu, &no_mouse_ctl);
+			add_debug_menu_entry(options_menu, &anchor_line);
 		}
 	}
 }
@@ -3887,6 +3908,63 @@ void handle_warp_entry(debug_menu_entry* entry) {
 	entity_teleport_abs_po(fancy_player_ptr[3], position, 1);
 }
 
+/*
+ * Pack discovery: lists every *.PCPACK under the game folder (4 levels deep) into the
+ * "Char Select (all packs)" menu and into the log ("[PACKS] ..."), so any character pack that
+ * exists on disk can be tried with the same path Char Select uses. Level / district packs are in
+ * the list too; picking one of those as a hero will most likely crash. Wolverine in the exe is a
+ * boss entity (script "wolverine", HG_BOSS_WOLVERINE), not a hero costume, so there may be no
+ * hero-style pack for him at all; this list shows what really exists.
+ */
+static int packs_found = 0;
+
+static void scan_packs_dir(const char* dir, int depth, debug_menu* menu) {
+	char pattern[MAX_PATH];
+	WIN32_FIND_DATAA fd;
+	HANDLE h;
+
+	if (depth > 4 || packs_found >= 380)
+		return;
+
+	snprintf(pattern, sizeof(pattern), "%s\\*", dir);
+	h = FindFirstFileA(pattern, &fd);
+	if (h == INVALID_HANDLE_VALUE)
+		return;
+	do {
+		if (fd.cFileName[0] == '.')
+			continue;
+		if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+			char sub[MAX_PATH];
+			snprintf(sub, sizeof(sub), "%s\\%s", dir, fd.cFileName);
+			scan_packs_dir(sub, depth + 1, menu);
+		}
+		else {
+			size_t n = strlen(fd.cFileName);
+			if (n > 7 && _stricmp(fd.cFileName + n - 7, ".PCPACK") == 0 && packs_found < 380) {
+				debug_menu_entry e;
+				memset(&e, 0, sizeof(e));
+				e.entry_type = NORMAL;
+				strncpy(e.text, fd.cFileName, n - 7 < MAX_CHARS_SAFE ? n - 7 : MAX_CHARS_SAFE);
+				add_debug_menu_entry(menu, &e);
+				packs_found++;
+				twop_log("[PACKS] %s\\%s\n", dir, fd.cFileName);
+			}
+		}
+	} while (FindNextFileA(h, &fd));
+	FindClose(h);
+}
+
+static void scan_packs(debug_menu* menu) {
+	char exe[MAX_PATH];
+	char* slash;
+	GetModuleFileNameA(NULL, exe, sizeof(exe));
+	slash = strrchr(exe, '\\');
+	if (slash)
+		*slash = 0;
+	scan_packs_dir(exe, 0, menu);
+	twop_log("[PACKS] %d pack files listed\n", packs_found);
+}
+
 void handle_char_select_entry(debug_menu_entry* entry) {
 
 	DWORD* some_number = (*(DWORD**)g_world_ptr) + 142;
@@ -3979,6 +4057,7 @@ void setup_debug_menu() {
 	progression_menu = create_menu("Progression", goto_start_debug, (menu_handler_function)handle_progression_select_entry, 10);
 	district_variants_menu = create_menu("District variants", goto_start_debug, (menu_handler_function)handle_distriction_variants_select_entry, 15);
 	add_player_menu = create_menu("Add 2nd Player", goto_start_debug, (menu_handler_function)handle_add_player_select_entry, 10);
+	debug_menu* all_packs_menu = create_menu("Char Select (all packs)", goto_start_debug, (menu_handler_function)handle_char_select_entry, 400);
 
 
 	debug_menu_entry warp_entry = { "Warp", NORMAL, warp_menu };
@@ -3993,6 +4072,9 @@ void setup_debug_menu() {
 	add_debug_menu_entry(start_debug, &district_entry);
 	add_debug_menu_entry(start_debug, &char_select);
 	add_debug_menu_entry(start_debug, &add_player_entry);
+	debug_menu_entry all_packs_entry = { "Char Select (all packs)", NORMAL, all_packs_menu };
+	add_debug_menu_entry(start_debug, &all_packs_entry);
+	scan_packs(all_packs_menu);
 	add_debug_menu_entry(start_debug, &options_entry);
 	add_debug_menu_entry(start_debug, &script_entry);
 	add_debug_menu_entry(start_debug, &progression_entry);
